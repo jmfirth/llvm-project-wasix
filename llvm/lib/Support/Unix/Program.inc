@@ -27,7 +27,9 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/StringSaver.h"
 #include "llvm/Support/raw_ostream.h"
+#if !defined(__wasi__)
 #include <sys/resource.h>
+#endif
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -137,6 +139,7 @@ static bool RedirectIO_PS(const std::string *Path, int FD, std::string *ErrMsg,
 static void TimeOutHandler(int Sig) {}
 
 static void SetMemoryLimits(unsigned size) {
+#if !defined(__wasi__)
   struct rlimit r;
   __typeof__(r.rlim_cur) limit = (__typeof__(r.rlim_cur))(size)*1048576;
 
@@ -149,6 +152,10 @@ static void SetMemoryLimits(unsigned size) {
   getrlimit(RLIMIT_RSS, &r);
   r.rlim_cur = limit;
   setrlimit(RLIMIT_RSS, &r);
+#endif
+#else
+  // WASI: rlimit not available; sandbox already memory-bounded by host runtime.
+  (void)size;
 #endif
 }
 
@@ -336,7 +343,7 @@ namespace sys {
 
 #if defined(_AIX)
 static pid_t(wait4)(pid_t pid, int *status, int options, struct rusage *usage);
-#elif !defined(__Fuchsia__)
+#elif !defined(__Fuchsia__) && !defined(__wasi__)
 using ::wait4;
 #endif
 
@@ -408,13 +415,20 @@ ProcessInfo llvm::sys::Wait(const ProcessInfo &PI,
   // Parent process: Wait for the child process to terminate.
   int status = 0;
   ProcessInfo WaitResult;
-#ifndef __Fuchsia__
+#if !defined(__Fuchsia__) && !defined(__wasi__)
   rusage Info;
   if (ProcStat)
     ProcStat->reset();
 
   do {
     WaitResult.Pid = sys::wait4(ChildPid, &status, WaitPidOptions, &Info);
+  } while (WaitUntilTerminates && WaitResult.Pid == -1 && errno == EINTR);
+#elif defined(__wasi__)
+  // WASI: wait4 / rusage not available; use waitpid without resource accounting.
+  if (ProcStat)
+    ProcStat->reset();
+  do {
+    WaitResult.Pid = waitpid(ChildPid, &status, WaitPidOptions);
   } while (WaitUntilTerminates && WaitResult.Pid == -1 && errno == EINTR);
 #endif
 
@@ -455,7 +469,7 @@ ProcessInfo llvm::sys::Wait(const ProcessInfo &PI,
     sigaction(SIGALRM, &Old, nullptr);
   }
 
-#ifndef __Fuchsia__
+#if !defined(__Fuchsia__) && !defined(__wasi__)
   if (ProcStat) {
     std::chrono::microseconds UserT = toDuration(Info.ru_utime);
     std::chrono::microseconds KernelT = toDuration(Info.ru_stime);

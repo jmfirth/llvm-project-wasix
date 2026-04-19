@@ -379,6 +379,14 @@ check_symbol_exists(mallinfo2 malloc.h HAVE_MALLINFO2)
 check_symbol_exists(malloc_zone_statistics malloc/malloc.h
                     HAVE_MALLOC_ZONE_STATISTICS)
 check_symbol_exists(posix_spawn spawn.h HAVE_POSIX_SPAWN)
+# Firebox #119 Phase 1.2d: wasix-libc provides posix_spawn but the
+# check_symbol_exists probe can fail under cross-compile+LTO configurations
+# (observed with YoWASP + wasi-sdk-pthread toolchain). Force-enable the
+# HAVE_POSIX_SPAWN path so llvm::sys::Execute uses posix_spawn on wasi
+# targets; this is what pulls __wasi_proc_spawn2 into the driver WASM.
+if(CMAKE_SYSTEM_NAME STREQUAL "WASI" OR CMAKE_C_COMPILER_TARGET MATCHES "wasi")
+  set(HAVE_POSIX_SPAWN 1)
+endif()
 check_symbol_exists(pread unistd.h HAVE_PREAD)
 check_symbol_exists(sbrk unistd.h HAVE_SBRK)
 check_symbol_exists(setjmp setjmp.h HAVE_SETJMP)

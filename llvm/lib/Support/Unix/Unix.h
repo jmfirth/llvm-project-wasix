@@ -30,9 +30,7 @@
 #include <string>
 #include <sys/types.h>
 
-#if !defined(__wasi__)
 #include <sys/wait.h>
-#endif
 
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>

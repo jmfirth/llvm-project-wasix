@@ -41,6 +41,17 @@ function( get_host_triple var )
     else()
       set( value "powerpc-ibm-aix" )
     endif()
+  elseif( CMAKE_SYSTEM_NAME STREQUAL "WASI" OR WASI )
+    # config.guess doesn't recognize wasi/wasm32 (uname output is
+    # "wasi" / "wasm32"). The inferred triple would be empty and
+    # get_host_triple fatal-errors. wasm32-wasi is the canonical
+    # triple for this build — the WebAssembly target backend emits
+    # it verbatim.
+    if( CMAKE_SYSTEM_PROCESSOR STREQUAL "wasm64" )
+      set( value "wasm64-wasi" )
+    else()
+      set( value "wasm32-wasi" )
+    endif()
   else()
     if(CMAKE_HOST_SYSTEM_NAME STREQUAL Windows AND NOT MSYS)
       message(WARNING "unable to determine host target triple")

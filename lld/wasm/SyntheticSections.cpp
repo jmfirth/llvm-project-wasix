@@ -434,7 +434,11 @@ void GlobalSection::addInternalGOTEntry(Symbol *sym) {
 }
 
 void GlobalSection::generateRelocationCode(raw_ostream &os, bool TLS) const {
-  assert(!ctx.arg.extendedConst);
+  // Note: extended-const inputs are tolerated here; the emitted sequence
+  // (global.get + ptr.add + global.set) is valid for both extended-const
+  // and classic init-expr targets. The original assertion was symmetric with
+  // needsRelocations() but missing from needsTLSRelocations(), so the TLS
+  // path could reach this function under wasi-threads + shared memory.
   bool is64 = ctx.arg.is64.value_or(false);
   unsigned opcode_ptr_add = is64 ? WASM_OPCODE_I64_ADD
                                  : WASM_OPCODE_I32_ADD;

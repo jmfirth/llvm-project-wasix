@@ -364,6 +364,10 @@ bool llvm::sys::RemoveFileOnSignal(StringRef Filename, std::string *ErrMsg) {
 }
 void llvm::sys::DontRemoveFileOnSignal(StringRef Filename) {}
 void llvm::sys::DisableSystemDialogsOnCrash() {}
+void llvm::sys::PrintStackTraceOnErrorSignal(StringRef Argv0,
+                                             bool DisableCrashReporting) {
+  // WASI has no signals; nothing to install.
+}
 #elif defined(LLVM_ON_UNIX)
 #include "Unix/Signals.inc"
 #elif defined(_WIN32)

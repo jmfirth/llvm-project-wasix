@@ -849,7 +849,17 @@ if (LLVM_ENABLE_WARNINGS AND (LLVM_COMPILER_IS_GCC_COMPATIBLE OR CLANG_CL))
     add_flag_if_supported("-Wc++98-compat-extra-semi" CXX98_COMPAT_EXTRA_SEMI_FLAG)
   endif()
 
-  append("-Wimplicit-fallthrough" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
+  # WASI: -Wimplicit-fallthrough's per-case-label recursion exhausts
+  # the WASM call stack on dense switches (e.g. clang/lib/Sema/SemaARM,
+  # SemaChecking, SemaOpenMP, SemaRISCV, SemaX86). WASM has no per-frame
+  # guard pages so stack reservation is a hard cap; bumping past 64 MiB
+  # does not address the underlying recursion-per-case problem (Firebox
+  # #103, #111). The flag protects user code authored against LLVM, not
+  # the compiler's own self-build, so dropping it from the WASI build of
+  # LLVM has no semantic impact on emitted code quality.
+  if(NOT WASI)
+    append("-Wimplicit-fallthrough" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
+  endif()
 
   set(CXX_SUPPORTS_COVERED_SWITCH_DEFAULT_FLAG 0)
   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")

@@ -876,6 +876,21 @@ set(wasm_SOURCES
 set(wasm32_SOURCES ${wasm_SOURCES})
 set(wasm64_SOURCES ${wasm_SOURCES})
 
+# WASIX/firebox: drop builtins that don't make sense on wasm targets.
+#   - emutls.c: emulated thread-local storage for platforms without
+#     __thread. wasm32-wasi-threads has real __thread support, so
+#     emutls is unused. Source includes <pthread.h> which fails in a
+#     freestanding-builtins compile (compiler-rt doesn't link libc).
+#   - enable_execute_stack.c: marks stack pages PROT_EXEC for trampoline
+#     code. WebAssembly has no executable memory concept; mmap header
+#     errors out with the WASI emulation guard. Already excluded for
+#     arm64 darwin upstream (line 728).
+#   - eprintf.c: legacy debug printf used by old code-gen paths.
+#     Includes <stdio.h>, which compiler-rt builtins must not depend
+#     on (they ship before libc).
+list(REMOVE_ITEM wasm32_SOURCES emutls.c enable_execute_stack.c eprintf.c)
+list(REMOVE_ITEM wasm64_SOURCES emutls.c enable_execute_stack.c eprintf.c)
+
 set(ve_SOURCES
   ve/grow_stack.S
   ve/grow_stack_align.S

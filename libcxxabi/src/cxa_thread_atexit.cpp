@@ -106,6 +106,13 @@ namespace {
 
 #endif // HAVE___CXA_THREAD_ATEXIT_IMPL
 
+// Firebox (firebox#862 Phase E / #909): include __wasi__ — wasi-threads targets
+// need the fallback __cxa_thread_atexit for C++ thread_local destructors
+// (wasi-libc has no __cxa_thread_atexit_impl). wasi-sdk's shipped libc++abi
+// defines this symbol (verified wasi-sdk-32 wasm32-wasi-threads:
+// `T __cxa_thread_atexit`); without it, linking any thread_local-using C++
+// guest (e.g. lld64) fails undefined-symbol. Pairs with the WASI branch in
+// src/CMakeLists.txt that puts this TU in LIBCXXABI_SOURCES at all.
 #if defined(__linux__) || defined(__Fuchsia__) || defined(__wasi__)
 extern "C" {
 
@@ -142,5 +149,5 @@ extern "C" {
 #endif // HAVE___CXA_THREAD_ATEXIT_IMPL
   }
 } // extern "C"
-#endif // defined(__linux__) || defined(__Fuchsia__)
+#endif // defined(__linux__) || defined(__Fuchsia__) || defined(__wasi__)
 } // namespace __cxxabiv1

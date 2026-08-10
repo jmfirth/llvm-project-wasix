@@ -647,6 +647,43 @@ Symbol *SymbolTable::addUndefinedFunction(StringRef name,
       lazy->extract();
       if (!ctx.arg.whyExtract.empty())
         ctx.whyExtractRecords.emplace_back(toString(file), s->getFile(), *s);
+      // extract() replaces the LazySymbol IN PLACE with the archive member's
+      // DefinedFunction, and `sig` -- the CALL SITE's signature -- was being
+      // dropped here. The signature check and the function-variant
+      // registration live in the sibling `else` branch, which is unreachable
+      // for this symbol, and addDefinedFunction cannot compensate: when the
+      // archive member is parsed by extract() above, `s` is still a
+      // LazySymbol, so addDefinedFunction takes its `wasInserted || isLazy()`
+      // early return BEFORE its own signature check -- and the call site's
+      // signature is not a parameter of that function anyway. This frame is
+      // the only one that holds both the extracted definition and `sig`.
+      //
+      // Without this, a mismatch that IS diagnosed and stubbed when the object
+      // precedes the archive is SILENTLY IGNORED when the archive precedes the
+      // object: wasm-ld exits 0, emits no diagnostic, and writes a module
+      // whose `call` is a type error. wasixcc always emits
+      // `wasm-ld <libs...> <objects...>`, so every wasixcc link took that path
+      // (firebox#WC2).
+      //
+      // Registering the variant is the WHOLE fix and it must not be
+      // accompanied by a reportFunctionSignatureMismatch() call here.
+      // getFunctionVariant() only records the variant; handleSymbolVariants()
+      // later emits the warning (isError=false) and calls
+      // replaceWithUnreachable() to synthesise the stub carrying the call
+      // site's signature. Reporting here as well is not merely redundant --
+      // that helper's `isError` parameter DEFAULTS TO TRUE, so it would
+      // error() and fail the link, which is the same fabricated `no` for
+      // AC_CHECK_FUNC that the silent path produces, just louder. MEASURED
+      // 2026-08-10 on exactly that shape: `error: function signature
+      // mismatch`, link_ok=no.
+      if (isCalledDirectly && sig) {
+        if (auto *extracted = dyn_cast<FunctionSymbol>(s)) {
+          if (!signatureMatches(extracted, sig)) {
+            if (getFunctionVariant(s, sig, file, &s))
+              replaceSym();
+          }
+        }
+      }
     }
   } else {
     auto existingFunction = dyn_cast<FunctionSymbol>(s);

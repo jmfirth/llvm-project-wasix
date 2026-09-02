@@ -178,9 +178,43 @@ inline _LIBCPP_HIDE_FROM_ABI bool __libcpp_thread_isnull(const __libcpp_thread_t
   return __libcpp_thread_get_id(__t) == 0;
 }
 
+// Firebox (firebox#5NS): reconcile this header with the nothreads libc profile.
+//
+// #P47/#S7V stopped DECLARING `pthread_create` in <pthread.h> on a sysroot whose
+// own <features.h> defines `__FIREBOX_NO_THREADS__` — a declaration with no
+// definition is invariant 0's false success, and a compile-only discovery probe
+// (CMake check_symbol_exists, meson has_header_symbol) reads a declaration and
+// stops. That is correct and stays.
+//
+// But this file is UNCONDITIONALLY PARSED by every TU that reaches
+// <__thread/support.h>, which <string>, <atomic> and <mutex> all do. With the
+// declaration gone, the body below is a hard parse error, so on that profile NO
+// C++ compiled at all — including libc++abi's own sources. The libc side
+// withdrew a name while the C++ side still spelled it: an asymmetry between what
+// the profile declares and what libc++ was configured to expect.
+//
+// The fix keeps BOTH ratified decisions intact by declaring the thread-support
+// entry point WITHOUT a definition on that profile — the same out-of-line shape
+// <__thread/support.h> documents for this contract function and windows.h
+// already uses:
+//   * #ZA3's LIBCXX_ENABLE_THREADS=ON stands: the VOCABULARY (std::mutex,
+//     std::lock_guard, std::condition_variable, TLS) compiles and links, because
+//     none of it touches pthread_create;
+//   * #ZA3's ratified failure mode for the CAPABILITY stands unchanged:
+//     `std::thread t(f)` still fails at LINK, now on
+//     `std::__libcpp_thread_create` instead of `pthread_create`;
+//   * #P47/#S7V stands: no pthread_create declaration is restored anywhere, so
+//     every discovery probe still answers "no thread creation here".
+//
+// RETIRES when the nothreads profile gains a real pthread_create (i.e. when
+// __FIREBOX_NO_THREADS__ stops being baked into that sysroot's <features.h>).
+#ifdef __FIREBOX_NO_THREADS__
+_LIBCPP_EXPORTED_FROM_ABI int __libcpp_thread_create(__libcpp_thread_t* __t, void* (*__func)(void*), void* __arg);
+#else
 inline _LIBCPP_HIDE_FROM_ABI int __libcpp_thread_create(__libcpp_thread_t* __t, void* (*__func)(void*), void* __arg) {
   return pthread_create(__t, nullptr, __func, __arg);
 }
+#endif
 
 inline _LIBCPP_HIDE_FROM_ABI __libcpp_thread_id __libcpp_thread_get_current_id() {
   const __libcpp_thread_t __current_thread = pthread_self();

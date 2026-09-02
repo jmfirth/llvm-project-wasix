@@ -354,19 +354,94 @@ static bool printMarkupStackTrace(StringRef Argv0, void **StackTrace, int Depth,
 
 // Include the platform-specific parts of this class.
 #if defined(__wasi__)
-// WASI does not have signals.
+// Firebox (firebox#967): THIS BLOCK IS A PORT GAP, NOT A PLATFORM LIMIT.
+//
+// The premise it shipped with — "WASI does not have signals" — is stale for
+// Firebox, which has real Linux signal semantics (sigaction/kill/raise, real
+// delivery, per-thread masks). It is still true for the *crash* half of this
+// interface, and the two halves must not be conflated:
+//
+//   * CRASH / BACKTRACE half — honestly empty on any wasm target. A wasm trap
+//     (OOB access, unreachable, call_indirect type error, stack exhaustion)
+//     terminates the store; it is not deliverable to a guest handler, so there
+//     is no fault to catch. And even a full Unix/Signals.inc port would print
+//     nothing here: the wasm32 configure leaves both HAVE_BACKTRACE and
+//     HAVE__UNWIND_BACKTRACE undefined (MEASURED, firebox#967), and LLVM is
+//     built -fno-exceptions against a sysroot with no unwinder. PrintStackTrace
+//     and PrintStackTraceOnErrorSignal are therefore faithful no-ops, not debt.
+//
+//   * REGISTRATION / CLEANUP half — NOT faithful, and knowingly so. Firebox
+//     delivers SIGINT/SIGTERM/SIGHUP/SIGQUIT/SIGPIPE/SIGUSR1 for real, so
+//     RemoveFileOnSignal returning "no error" while registering nothing is a
+//     false success in invariant-0 terms: an interrupted `clang -c` leaves the
+//     partial .o that Linux would have unlinked. Porting the lifecycle half
+//     (an atomic handler table + the FilesToRemove list + sigaction installs
+//     for those six signals, i.e. roughly Unix/Signals.inc minus the backtrace
+//     machinery) is tracked separately; it cannot be validated without a full
+//     in-guest LLVM rebuild and does not belong in the same commit as this one.
+//
+// WHY THESE SIX DEFINITIONS ARE HERE AT ALL. The block defined seven of the
+// THIRTEEN platform entry points Unix/Signals.inc defines and Signals.h
+// declares LLVM_ABI. The six below were declared and never defined on this
+// target. That is invisible to a normal LLVM build only because --gc-sections
+// drops whichever referrer nothing calls; an export-rooted link (the PIC thin
+// link's --export-dynamic, firebox#MQQ) roots LLVM's whole public API and the
+// hole becomes an undefined symbol. firebox#967 hit exactly one of them —
+// SetInfoSignalFunction, via EnablePrettyStackTraceOnSigInfoForThisThread,
+// which is live because the wasm32 configure DOES set ENABLE_BACKTRACES=1.
+// Adding only that one would leave five identical landmines, so all six land
+// together (invariant 1: fix the class, not the symptom).
+//
+// Live referrers, MEASURED 2026-09-02 on this tree:
+//   unregisterHandlers              CrashRecoveryContext.cpp:495 (libLLVMSupport
+//                                   itself), llvm-exegesis
+//   PrintStackTrace                 libclang CIndex.cpp:10165
+//   SetInterruptFunction            bugpoint
+//   SetInfoSignalFunction           PrettyStackTrace.cpp:308  <- firebox#967
+//   SetOneShotPipeSignalFunction    InitLLVM.cpp:93 (__wasi__-guarded today)
+//   DefaultOneShotPipeSignalHandler InitLLVM.cpp:93 (likewise)
+//
+// Retires when the lifecycle port above lands (these become real) or when
+// upstream LLVM carries a WASI signal port. Do NOT "simplify" this to
+// `#include "Unix/Signals.inc"`: that pulls in dlfcn/link.h/backtrace and the
+// llvm-symbolizer fork-exec path, none of which has a wasm meaning.
+#include "llvm/Support/ExitCodes.h" // EX_IOERR, for the pipe handler below
+#include <cstdlib>
+
 void llvm::sys::AddSignalHandler(sys::SignalHandlerCallback FnPtr,
                                  void *Cookie) {}
 void llvm::sys::RunInterruptHandlers() {}
 void sys::CleanupOnSignal(uintptr_t Context) {}
 bool llvm::sys::RemoveFileOnSignal(StringRef Filename, std::string *ErrMsg) {
+  // Returns "no error" and registers nothing. See the REGISTRATION half above:
+  // this is the one stub in this block that is a false success rather than an
+  // honest absence, and it is left as-is deliberately — the return value is
+  // ignored by every in-tree caller (LTO.cpp, DTLTO.cpp, CompilerInstance.cpp,
+  // cc1as_main.cpp), so flipping it to `true` would only add a diagnostic path
+  // nobody reads while still not removing the file. The fix is the port.
   return false;
 }
 void llvm::sys::DontRemoveFileOnSignal(StringRef Filename) {}
 void llvm::sys::DisableSystemDialogsOnCrash() {}
 void llvm::sys::PrintStackTraceOnErrorSignal(StringRef Argv0,
                                              bool DisableCrashReporting) {
-  // WASI has no signals; nothing to install.
+  // No fault signal can reach a wasm guest handler; nothing to install.
+}
+void llvm::sys::PrintStackTrace(raw_ostream &OS, int Depth) {
+  // No backtrace provider on this target (HAVE_BACKTRACE and
+  // HAVE__UNWIND_BACKTRACE are both undefined for wasm32), so Unix/Signals.inc
+  // would emit nothing here either. Empty is the faithful body, not a stub.
+}
+void sys::unregisterHandlers() {}
+void llvm::sys::SetInterruptFunction(void (*IF)()) {}
+void llvm::sys::SetInfoSignalFunction(void (*Handler)()) {}
+void llvm::sys::SetOneShotPipeSignalFunction(void (*Handler)()) {}
+void llvm::sys::DefaultOneShotPipeSignalHandler() {
+  // Unix exits EX_IOERR so drivers can distinguish a closed-pipe death from a
+  // real failure. Keep that behaviour: it is a plain exit(), it needs no signal
+  // machinery, and a caller that reaches this function has already decided the
+  // pipe is gone.
+  exit(EX_IOERR);
 }
 #elif defined(LLVM_ON_UNIX)
 #include "Unix/Signals.inc"

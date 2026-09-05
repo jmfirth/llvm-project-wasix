@@ -83,6 +83,26 @@ InitLLVM::InitLLVM(int &Argc, const char **&Argv,
   // Bring stdin/stdout/stderr into a known state.
   sys::AddSignalHandler(CleanupStdHandles, nullptr);
 
+  // Firebox (firebox#E44): this gate used to cover five statements, and only
+  // the first three of them have anything to do with signals. The two below it
+  // were swept up by a signal-shaped gate, and one of them is load-bearing.
+  //
+  // What stays gated, and why. All three belong to the crash/backtrace half of
+  // llvm::sys signal handling, which is honestly empty on this target
+  // (firebox#967): a wasm trap terminates the store rather than being delivered
+  // to a guest handler, and the wasm32 configure leaves HAVE_BACKTRACE and
+  // HAVE__UNWIND_BACKTRACE undefined, so a fully ported PrintStackTrace would
+  // print nothing anyway. Concretely, PrettyStackTrace reaches stderr only from
+  // the CrashHandler that EnablePrettyStackTrace registers via
+  // sys::AddSignalHandler, which is a no-op in Signals.cpp's __wasi__ block, so
+  // StackPrinter.emplace and PrintStackTraceOnErrorSignal produce no observable
+  // output here whether they run or not.
+  //
+  // SetOneShotPipeSignalFunction is the one that is deferred rather than
+  // impossible: Firebox does deliver SIGPIPE, but the registration half of
+  // Signals.cpp is not ported (its setter stores the handler nowhere), so
+  // calling it would be a no-op that reads as if the facility worked. That gate
+  // comes off with the lifecycle port, firebox#YWS -- not here.
 #if !defined(__wasi__)
   if (InstallPipeSignalExitHandler)
     // The pipe signal handler must be installed before any other handlers are
@@ -95,9 +115,24 @@ InitLLVM::InitLLVM(int &Argc, const char **&Argv,
   // handler, so we can perform a sigaction() for SIGPIPE on Unix if requested.
   StackPrinter.emplace(Argc, Argv);
   sys::PrintStackTraceOnErrorSignal(Argv[0]);
+#endif
+
+  // Not signal machinery, and no platform reason to skip either one.
+  //
+  // install_out_of_memory_new_handler is pure C++: with LLVM_ENABLE_EXCEPTIONS
+  // off -- which is how every wasm32 build of this tree is configured -- it is
+  // a std::set_new_handler call whose handler writes "LLVM ERROR: out of
+  // memory" to fd 2 and aborts. Skipping it was a false success in invariant-0
+  // terms: an in-guest tool that hits the wasm memory ceiling died on the
+  // libc++ bad_alloc path with no diagnostic at all, where the same tool on
+  // Linux prints the error. std::set_new_handler needs nothing the host cannot
+  // provide, so "wasi" was never a bound here.
+  //
+  // RaiseLimits' entire body is #ifdef _AIX, so on this target it already
+  // compiles to nothing; gating it added no behaviour and only guaranteed that
+  // a future non-AIX branch would be silently skipped on wasi.
   install_out_of_memory_new_handler();
   RaiseLimits();
-#endif
 
 #ifdef __MVS__
 

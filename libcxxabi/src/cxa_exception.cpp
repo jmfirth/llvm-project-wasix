@@ -140,6 +140,43 @@ exception_cleanup_func(_Unwind_Reason_Code reason, _Unwind_Exception* unwind_exc
     __cxa_decrement_exception_refcount(unwind_exception + 1);
 }
 
+#if defined(__WASM_EXCEPTIONS__) && defined(__wasi__)
+// firebox#ZVA — the no-handler path, for a target with no phase-1 search.
+//
+// Wasm EH has no search phase: _Unwind_RaiseException is a bare `throw` and
+// never returns, so the failed_throw() calls below are dead code there and an
+// exception nothing catches would escape the module entry point as a host
+// trap. wasix-libc runs ctors/main/dtors and every thread start routine under
+// a guard that catches `__cpp_exception` and hands the payload (the
+// `_Unwind_Exception*` this file threw) to the hook registered below, which
+// then does exactly what the three raise sites below do when the raise
+// returns: native exceptions get __cxa_begin_catch (so the terminate handler
+// sees std::current_exception()) and std::__terminate with the handler
+// captured at throw time; a foreign one can only std::terminate().
+//
+// The difference from a phase-1 platform is inherent and standard-permitted
+// ([except.handle]/9): by the time the guard sees the exception, the unwound
+// frames' destructors have already run.
+extern "C" void __wasilibc_set_cxx_uncaught_hook(void (*)(void*));
+
+static _LIBCXXABI_NORETURN void __cxa_wasm_uncaught(void* payload) {
+    _Unwind_Exception* unwind_exception = static_cast<_Unwind_Exception*>(payload);
+    (void) __cxa_begin_catch(unwind_exception);
+    if (__isOurExceptionClass(unwind_exception))
+        std::__terminate(
+            cxa_exception_from_exception_unwind_exception(unwind_exception)->terminateHandler);
+    std::terminate();
+}
+
+// Called right before every raise. Idempotent; see wasix-libc's
+// __wasilibc_cxx_guard.c for why the registration is lazy.
+static inline void register_uncaught_hook() {
+    __wasilibc_set_cxx_uncaught_hook(__cxa_wasm_uncaught);
+}
+#else
+static inline void register_uncaught_hook() {}
+#endif
+
 static _LIBCXXABI_NORETURN void failed_throw(__cxa_exception* exception_header) {
 //  Section 2.5.3 says:
 //      * For purposes of this ABI, several things are considered exception handlers:
@@ -291,6 +328,7 @@ __cxa_throw(void *thrown_object, std::type_info *tinfo, void (_LIBCXXABI_DTOR_FU
   __asan_handle_no_return();
 #endif
 
+    register_uncaught_hook();
 #ifdef __USING_SJLJ_EXCEPTIONS__
     _Unwind_SjLj_RaiseException(&exception_header->unwindHeader);
 #else
@@ -645,6 +683,7 @@ void __cxa_rethrow() {
         //   nothing
         globals->caughtExceptions = 0;
     }
+    register_uncaught_hook();
 #ifdef __USING_SJLJ_EXCEPTIONS__
     _Unwind_SjLj_RaiseException(&exception_header->unwindHeader);
 #else
@@ -770,6 +809,7 @@ __cxa_rethrow_primary_exception(void* thrown_object)
         setDependentExceptionClass(&dep_exception_header->unwindHeader);
         __cxa_get_globals()->uncaughtExceptions += 1;
         dep_exception_header->unwindHeader.exception_cleanup = dependent_exception_cleanup;
+        register_uncaught_hook();
 #ifdef __USING_SJLJ_EXCEPTIONS__
         _Unwind_SjLj_RaiseException(&dep_exception_header->unwindHeader);
 #else

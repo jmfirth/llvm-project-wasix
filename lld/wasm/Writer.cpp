@@ -558,6 +558,8 @@ void Writer::addSections() {
   addSection(out.producersSec);
   addSection(out.targetFeaturesSec);
   addSection(out.buildIdSec);
+  addSection(out.sonameSec); // FIREBOX PATCH (firebox#CTX): last, as the
+                             // provider transaction appends it.
 }
 
 void Writer::finalizeSections() {
@@ -1711,6 +1713,7 @@ void Writer::createSyntheticSections() {
   out.producersSec = make<ProducersSection>();
   out.targetFeaturesSec = make<TargetFeaturesSection>();
   out.buildIdSec = make<BuildIdSection>();
+  out.sonameSec = make<SonameSection>(); // FIREBOX PATCH (firebox#CTX)
 }
 
 void Writer::createSyntheticSectionsPostLayout() {

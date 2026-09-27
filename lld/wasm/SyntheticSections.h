@@ -467,6 +467,36 @@ private:
   uint8_t *hashPlaceholderPtr = nullptr;
 };
 
+// FIREBOX PATCH (firebox#CTX): `firebox.soname`, the wasm analog of ELF
+// DT_SONAME. A custom section whose payload is one wasm `name` (uleb length +
+// UTF-8). `wasm-ld -soname=N` writes it; a module that links against a shared
+// object carrying it records N in its dylink.0 NEEDED instead of the input's
+// filename, so `-lc` against a `libc.so` development alias binds the
+// generation-qualified provider exactly as a Linux `-lc` binds `libc.so.6`.
+// Without it NEEDED is the filename, which is upstream behavior, unchanged.
+//
+// WHY A CUSTOM SECTION AND NOT A dylink.0 SUBSECTION: MEASURED 2026-09-26, an
+// unknown dylink.0 subsection (id 0x40) makes `wasm-tools print` (1.258.0)
+// refuse the whole module ("don't know how to print dylink.0 subsection id
+// 64"), while wasm-tools validate/print, wabt, llvm-objdump, llvm-nm and
+// wasm-opt all accept an unknown custom section. It is also outside every
+// Firebox libc generation projection, which reads only dylink.0 and
+// target_features among the custom sections.
+//
+// RETIRES when upstream tool-conventions defines a soname for dylink.0: move
+// this payload (byte-identical) into that subsection and drop the section
+// (docs/reference/forks.md section 5, llvm-project-wasix).
+//
+// Written only when `-soname` is given, and never dropped by --strip-all: like
+// dylink.0 it is linking semantics, not debug information.
+class SonameSection : public SyntheticSection {
+public:
+  SonameSection()
+      : SyntheticSection(llvm::wasm::WASM_SEC_CUSTOM, "firebox.soname") {}
+  bool isNeeded() const override { return !ctx.arg.soName.empty(); }
+  void writeBody() override;
+};
+
 // Linker generated output sections
 struct OutStruct {
   DylinkSection *dylinkSec;
@@ -486,6 +516,7 @@ struct OutStruct {
   ProducersSection *producersSec;
   TargetFeaturesSection *targetFeaturesSec;
   BuildIdSection *buildIdSec;
+  SonameSection *sonameSec; // FIREBOX PATCH (firebox#CTX)
 };
 
 extern OutStruct out;

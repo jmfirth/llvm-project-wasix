@@ -76,7 +76,7 @@ void DylinkSection::writeBody() {
     SubSection sub(WASM_DYLINK_NEEDED);
     writeUleb128(sub.os, ctx.sharedFiles.size(), "Needed");
     for (auto *so : ctx.sharedFiles)
-      writeStr(sub.os, llvm::sys::path::filename(so->getName()), "so name");
+      writeStr(sub.os, so->neededName(), "so name"); // FIREBOX PATCH (firebox#CTX)
     sub.writeTo(os);
   }
 
@@ -795,6 +795,11 @@ unsigned NameSection::numNamedDataSegments() const {
       ++numNames;
 
   return numNames;
+}
+
+// FIREBOX PATCH (firebox#CTX): see SonameSection in SyntheticSections.h.
+void SonameSection::writeBody() {
+  writeStr(bodyOutputStream, ctx.arg.soName, "soname");
 }
 
 // Create the custom "name" section containing debug symbol names.

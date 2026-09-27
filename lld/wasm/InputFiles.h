@@ -156,6 +156,12 @@ public:
 
   void parse();
 
+  // FIREBOX PATCH (firebox#CTX): the name a module linking against this one
+  // records in its dylink.0 NEEDED — the input's own `firebox.soname` when it
+  // carries one (ELF DT_SONAME semantics; see SonameSection), else the input's
+  // filename, which is exactly upstream's behavior for every other module.
+  StringRef neededName() const;
+
   static bool classof(const InputFile *f) { return f->kind() == SharedKind; }
 };
 

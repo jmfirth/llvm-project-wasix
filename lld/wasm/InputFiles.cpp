@@ -18,6 +18,7 @@
 #include "llvm/Object/Binary.h"
 #include "llvm/Object/Wasm.h"
 #include "llvm/ProfileData/InstrProf.h"
+#include "llvm/Support/LEB128.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/TarWriter.h"
 #include "llvm/Support/raw_ostream.h"
@@ -427,6 +428,45 @@ ObjFile::ObjFile(MemoryBufferRef m, StringRef archiveName, bool lazy)
   // mark it live.
   if (!lazy)
     markLive();
+}
+
+// FIREBOX PATCH (firebox#CTX): `firebox.soname`, the wasm analog of ELF
+// DT_SONAME. A custom section whose payload is one wasm `name` (uleb length +
+// UTF-8). `wasm-ld -soname=N` writes it; a module that links against a shared
+// object carrying it records N in its dylink.0 NEEDED instead of the input's
+// filename, so `-lc` against a `libc.so` development alias binds the
+// generation-qualified provider exactly as a Linux `-lc` binds `libc.so.6`.
+// Without it NEEDED is the filename, which is upstream behavior, unchanged.
+//
+// WHY A CUSTOM SECTION AND NOT A dylink.0 SUBSECTION: MEASURED 2026-09-26, an
+// unknown dylink.0 subsection (id 0x40) makes `wasm-tools print` (1.258.0)
+// refuse the whole module ("don't know how to print dylink.0 subsection id
+// 64"), while wasm-tools validate/print, wabt, llvm-objdump, llvm-nm and
+// wasm-opt all accept an unknown custom section. It is also outside every
+// Firebox libc generation projection, which reads only dylink.0 and
+// target_features among the custom sections.
+//
+// RETIRES when upstream tool-conventions defines a soname for dylink.0: move
+// this payload (byte-identical) into that subsection and drop the section
+// (docs/reference/forks.md section 5, llvm-project-wasix).
+StringRef SharedFile::neededName() const {
+  for (const SectionRef &ref : wasmObj->sections()) {
+    const WasmSection &sec = wasmObj->getWasmSection(ref);
+    if (sec.Type != WASM_SEC_CUSTOM || sec.Name != "firebox.soname")
+      continue;
+    // One wasm `name`: a uleb128 length, then exactly that many bytes.
+    const uint8_t *p = sec.Content.data();
+    const uint8_t *end = p + sec.Content.size();
+    unsigned n = 0;
+    const char *err = nullptr;
+    uint64_t len = llvm::decodeULEB128(p, &n, end, &err);
+    if (err || len != uint64_t(end - p - n) || len == 0) {
+      error(toString(this) + ": malformed firebox.soname section");
+      break;
+    }
+    return StringRef(reinterpret_cast<const char *>(p + n), len);
+  }
+  return llvm::sys::path::filename(getName());
 }
 
 void SharedFile::parse() {

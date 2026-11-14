@@ -1016,8 +1016,10 @@ void CodeGenModule::Release() {
   if (LangOpts.Sanitize.has(SanitizerKind::KCFI))
     finalizeKCFITypes();
   emitAtAvailableLinkGuard();
-  if (Context.getTargetInfo().getTriple().isWasm())
+  if (Context.getTargetInfo().getTriple().isWasm()) {
     EmitMainVoidAlias();
+    EmitLegacyWasmCallbacks();
+  }
 
   if (getTriple().isAMDGPU() ||
       (getTriple().isSPIRV() && getTriple().getVendor() == llvm::Triple::AMD)) {

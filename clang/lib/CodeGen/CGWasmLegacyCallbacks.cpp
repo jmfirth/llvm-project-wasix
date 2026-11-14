@@ -11,8 +11,11 @@
 // from ALL its address uses while the source types are still available. Only
 // ignored scalar arguments and an ignored scalar result can be adapted. Unknown
 // escapes and conflicting prototypes keep the ordinary, strict call behavior.
+// There is no false success: the only new failures are loud traps of calls at
+// the function's own type through an invisible round trip (e.g. through memory).
+// A visible conversion back to that type rejects the candidate.
 //
-// One canonical wrapper owns every address; direct calls still name the private
+// One canonical wrapper owns every address; direct calls still name the
 // original body. This is deliberately not a per-use cast thunk: two addresses of
 // the same source function must compare equal, including across library calls.
 // Firebox #5XP. Retire when upstream provides equivalent identity-preserving
@@ -27,6 +30,7 @@
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/GlobalIFunc.h"
 #include "llvm/IR/IRBuilder.h"
@@ -43,14 +47,91 @@ public:
     const FunctionDecl *Definition = nullptr;
     QualType Prototype;
     bool Reject = false;
-    bool Direct = false;
+    bool ConsumesDirectResult = false;
   };
 
   // AST visitation order, rather than pointer hash order, determines IR order.
   llvm::MapVector<const FunctionDecl *, Candidate> Candidates;
   bool HasAsm = false;
+  llvm::StringSet<> AlternateNames;
 
   explicit LegacyCallbackUses(ASTContext &Context) : Context(Context) {}
+
+  bool VisitFunctionDecl(FunctionDecl *FD) {
+    // A different declaration can resolve to the same LLVM function. Exclude
+    // its target even when the declaration is never referenced in source.
+    // Unrelated redirects in system headers must not disable the whole TU.
+    auto Record = [&](StringRef Name) {
+      Name.consume_front("\01");
+      if (!Name.empty())
+        AlternateNames.insert(Name);
+    };
+    if (const auto *A = FD->getAttr<WeakRefAttr>())
+      Record(A->getAliasee());
+    if (const auto *A = FD->getAttr<AliasAttr>())
+      Record(A->getAliasee());
+    if (const auto *A = FD->getAttr<AsmLabelAttr>())
+      Record(A->getLabel());
+    return true;
+  }
+
+  bool discardsResult(const Expr *E) {
+    DynTypedNode Node = DynTypedNode::create(*E);
+    for (;;) {
+      auto Parents = Context.getParents(Node);
+      if (Parents.size() != 1)
+        return false;
+      Node = Parents[0];
+      if (const auto *P = Node.get<ParenExpr>()) {
+        E = P;
+        continue;
+      }
+      if (const auto *Cast = Node.get<CastExpr>())
+        return Cast->getType()->isVoidType();
+      if (const auto *B = Node.get<BinaryOperator>()) {
+        if (B->getOpcode() != BO_Comma)
+          return false;
+        if (B->getLHS() == E)
+          return true;
+        E = B;
+        continue;
+      }
+      if (const auto *C = Node.get<ConditionalOperator>()) {
+        if (C->getCond() == E)
+          return false;
+        E = C;
+        continue;
+      }
+      if (const auto *S = Node.get<CompoundStmt>()) {
+        // The last expression of a GNU statement expression can supply a
+        // consumed result; ordinary expression statements discard theirs.
+        if (!S->body_empty() && S->body_back() == E) {
+          auto Outer = Context.getParents(Node);
+          if (Outer.size() == 1)
+            if (const auto *StatementExpr = Outer[0].get<StmtExpr>()) {
+              E = StatementExpr;
+              Node = Outer[0];
+              continue;
+            }
+        }
+        return true;
+      }
+      if (Node.get<LabelStmt>() || Node.get<SwitchCase>() ||
+          Node.get<AttributedStmt>())
+        return true;
+      if (const auto *S = Node.get<IfStmt>())
+        return S->getThen() == E || S->getElse() == E;
+      if (const auto *S = Node.get<WhileStmt>())
+        return S->getBody() == E;
+      if (const auto *S = Node.get<DoStmt>())
+        return S->getBody() == E;
+      if (const auto *S = Node.get<ForStmt>())
+        return S->getInit() == E || S->getInc() == E || S->getBody() == E;
+      if (const auto *S = Node.get<SwitchStmt>())
+        return S->getBody() == E;
+      return false;
+    }
+  }
 
   bool VisitGCCAsmStmt(GCCAsmStmt *) {
     HasAsm = true;
@@ -74,21 +155,38 @@ public:
     // updating the older definition's type or attributes.
     if (llvm::any_of(FD->redecls(), [](const FunctionDecl *R) {
           return R->getType()->isFunctionProtoType() || R->hasAttr<UsedAttr>() ||
-                 R->hasAttr<RetainAttr>() || R->hasAttr<AsmLabelAttr>();
+                 R->hasAttr<RetainAttr>() || R->hasAttr<AsmLabelAttr>() ||
+                 R->hasAttr<WeakRefAttr>() || R->hasAttr<AliasAttr>();
         }))
       return true;
 
     Candidate &C = Candidates[FD->getCanonicalDecl()];
     C.Definition = Definition;
     const Expr *Current = E;
+    bool SawCallbackConversion = false;
     DynTypedNode Node = DynTypedNode::create(*E);
     for (;;) {
       auto Parents = Context.getParents(Node);
-      if (Parents.size() != 1) {
+      if (Parents.size() > 1) {
+        // Designated initializers share their converted initializer between
+        // the syntactic DesignatedInitExpr and the semantic InitListExpr.
+        const DynTypedNode *Semantic = nullptr;
+        for (const auto &P : Parents)
+          if (const auto *I = P.get<InitListExpr>())
+            if (I->isSemanticForm())
+              Semantic = &P;
+        if (Semantic)
+          Node = *Semantic;
+        else {
+          C.Reject = true;
+          return true;
+        }
+      } else if (Parents.size() == 1) {
+        Node = Parents[0];
+      } else {
         C.Reject = true;
         return true;
       }
-      Node = Parents[0];
       if (const auto *Cast = Node.get<CastExpr>()) {
         // A void-pointer cast may be followed by a typed callback conversion
         // (a common old-C idiom). It is not itself evidence of a prototype.
@@ -96,6 +194,18 @@ public:
         if (!T->isFunctionPointerType() && !T->isVoidPointerType()) {
           C.Reject = true;
           return true;
+        }
+        if (T->isFunctionPointerType()) {
+          QualType F = T->getPointeeType();
+          const auto *P = F->getAs<FunctionProtoType>();
+          if (SawCallbackConversion && (!P || P->getNumParams() == 0)) {
+            C.Reject = true;
+            return true;
+          }
+          SawCallbackConversion |=
+              P && (P->getNumParams() != 0 ||
+                    !Context.hasSameType(P->getReturnType(),
+                                         Definition->getReturnType()));
         }
         Current = Cast;
         continue;
@@ -111,7 +221,13 @@ public:
         }
       }
       if (const auto *Conditional = Node.get<ConditionalOperator>()) {
+        if (Conditional->getCond() == Current)
+          return true;
         Current = Conditional;
+        continue;
+      }
+      if (const auto *Designated = Node.get<DesignatedInitExpr>()) {
+        Current = Designated;
         continue;
       }
       if (const auto *Generic = Node.get<GenericSelectionExpr>()) {
@@ -126,7 +242,7 @@ public:
         if (Call->getCallee() == Current && Call->getDirectCallee() &&
             Call->getDirectCallee()->getCanonicalDecl() ==
                 FD->getCanonicalDecl()) {
-          C.Direct = true;
+          C.ConsumesDirectResult |= !discardsResult(Call);
           return true;
         }
         // A typed cast passed to an unprototyped or variadic consumer is
@@ -147,8 +263,9 @@ public:
           return true;
         }
       } else if (const auto *Binary = Node.get<BinaryOperator>()) {
-        if ((!Binary->isAssignmentOp() || Binary->getRHS() != Current) &&
-            Binary->getOpcode() != BO_EQ && Binary->getOpcode() != BO_NE) {
+        if (Binary->getOpcode() == BO_EQ || Binary->getOpcode() == BO_NE)
+          return true;
+        if (!Binary->isAssignmentOp() || Binary->getRHS() != Current) {
           C.Reject = true;
           return true;
         }
@@ -175,12 +292,38 @@ public:
   }
 };
 
+struct SourceAddressCleanup {
+  llvm::MapVector<const FunctionDecl *, llvm::GlobalAlias *> &Addresses;
+  ~SourceAddressCleanup() {
+    for (auto &Entry : Addresses) {
+      auto *Source = Entry.second;
+      Source->replaceAllUsesWith(Source->getAliasee());
+      Source->eraseFromParent();
+    }
+    Addresses.clear();
+  }
+};
+
 bool isScalarABIType(QualType T) {
   return T->isPointerType() || T->isRealType();
 }
 
-// An alias, annotation, constructor list, or blockaddress can refer to a
-// function without a source DeclRefExpr and therefore without the use audit.
+// Every address reachable through Source was emitted by a source expression
+// covered by the AST audit. All other body uses must be direct call operands,
+// including instruction uses: CodeGen can synthesize stores and call arguments.
+bool hasUnauditedBodyUse(llvm::Function *Body, llvm::GlobalAlias *Source) {
+  for (llvm::Use &U : Body->uses()) {
+    if (U.getUser() == Source)
+      continue;
+    const auto *Call = dyn_cast<llvm::CallBase>(U.getUser());
+    if (!Call || !Call->isCallee(&U))
+      return true;
+  }
+  return false;
+}
+
+// Source expressions can still enter special IR structures that cannot be
+// adapted (annotations, retained lists, aliases, ifuncs, blockaddresses).
 bool hasUnauditedIRUse(llvm::Value *V,
                       llvm::SmallPtrSetImpl<llvm::Value *> &Seen) {
   if (!Seen.insert(V).second)
@@ -199,7 +342,28 @@ bool hasUnauditedIRUse(llvm::Value *V,
 }
 } // namespace
 
+llvm::Constant *CodeGenModule::getLegacyWasmSourceAddress(
+    const FunctionDecl *FD, llvm::Constant *Address) {
+  if (!getTriple().isWasm() || LangOpts.CPlusPlus || LangOpts.C23 ||
+      !LangOpts.Sanitize.empty() || !FD->getType()->isFunctionNoProtoType() ||
+      FD->getNumParams() || FD->getFormalLinkage() != Linkage::Internal)
+    return Address;
+  auto *Body = dyn_cast<llvm::Function>(Address);
+  if (!Body)
+    return Address;
+  auto &Source = LegacyWasmSourceAddresses[FD->getCanonicalDecl()];
+  if (!Source)
+    Source = llvm::GlobalAlias::create(Body->getValueType(),
+                                      Body->getAddressSpace(),
+                                      llvm::GlobalValue::InternalLinkage,
+                                      "", Body, &getModule());
+  return Source;
+}
+
 void CodeGenModule::EmitLegacyWasmCallbacks() {
+  // These transient aliases only distinguish source addresses from synthesized
+  // uses during CodeGen. They never survive Release(), even for rejected TUs.
+  SourceAddressCleanup RestoreSourceAddresses{LegacyWasmSourceAddresses};
   // Sanitizer type/entry instrumentation is tied to the source signature.
   // Leave it strict until wrappers participate in that instrumentation too.
   if (!getTriple().isWasm() || LangOpts.CPlusPlus || LangOpts.C23 ||
@@ -215,6 +379,11 @@ void CodeGenModule::EmitLegacyWasmCallbacks() {
     auto &C = Entry.second;
     if (C.Reject || C.Prototype.isNull())
       continue;
+    if (getCodeGenOpts().RegisterGlobalDtorsWithAtExit &&
+        llvm::any_of(C.Definition->redecls(), [](const FunctionDecl *R) {
+          return R->hasAttr<DestructorAttr>() || R->hasAttr<ConstructorAttr>();
+        }))
+      continue;
     const auto *Prototype = C.Prototype->castAs<FunctionProtoType>();
     if (Prototype->isVariadic() || Prototype->getCallConv() != CC_C ||
         Prototype->hasExtParameterInfos() ||
@@ -225,7 +394,8 @@ void CodeGenModule::EmitLegacyWasmCallbacks() {
     QualType NewReturn = Prototype->getReturnType();
     bool Discard = NewReturn->isVoidType() && isScalarABIType(OldReturn);
     if ((!OldReturn->isVoidType() && !isScalarABIType(OldReturn)) ||
-        (!Context.hasSameType(OldReturn, NewReturn) && (!Discard || C.Direct)))
+        (!Context.hasSameType(OldReturn, NewReturn) &&
+         (!Discard || C.ConsumesDirectResult)))
       continue;
     auto *Body = getModule().getFunction(getMangledName(GlobalDecl(C.Definition)));
     if (!Body || Body->isDeclaration() || !Body->hasInternalLinkage() ||
@@ -234,15 +404,22 @@ void CodeGenModule::EmitLegacyWasmCallbacks() {
         Body->getAddressSpace() != 0 ||
         Body->hasFnAttribute("wasm-export-name"))
       continue;
+    StringRef BodyName = Body->getName();
+    BodyName.consume_front("\01");
+    if (Uses.AlternateNames.contains(BodyName))
+      continue;
     // These lists are materialized by emitLLVMUsed() later in Release().
     // They can contain compiler-generated uses with no DeclRefExpr.
-    auto IsBody = [Body](const llvm::WeakTrackingVH &V) {
-      return static_cast<llvm::Value *>(V) == Body;
+    auto *Source = LegacyWasmSourceAddresses.lookup(Entry.first);
+    auto IsBody = [Body, Source](const llvm::WeakTrackingVH &V) {
+      return static_cast<llvm::Value *>(V) == Body ||
+             static_cast<llvm::Value *>(V) == Source;
     };
     if (llvm::any_of(LLVMUsed, IsBody) || llvm::any_of(LLVMCompilerUsed, IsBody))
       continue;
     llvm::SmallPtrSet<llvm::Value *, 8> Seen;
-    if (hasUnauditedIRUse(Body, Seen))
+    if (!Source || hasUnauditedBodyUse(Body, Source) ||
+        hasUnauditedIRUse(Source, Seen))
       continue;
 
     const CGFunctionInfo &Info = getTypes().arrangeFreeFunctionType(
@@ -263,9 +440,9 @@ void CodeGenModule::EmitLegacyWasmCallbacks() {
       continue;
 
     std::string Symbol = Body->getName().str();
-    Body->setName(Symbol + ".legacy.body");
     auto *Canonical = llvm::Function::Create(
-        FT, llvm::GlobalValue::InternalLinkage, Symbol, getModule());
+        FT, llvm::GlobalValue::InternalLinkage, Symbol + ".wasm.callback",
+        getModule());
     llvm::AttributeList ABIAttrs;
     unsigned CallingConv;
     ConstructAttributeList(Symbol, Info, CGCalleeInfo(), ABIAttrs, CallingConv,
@@ -275,7 +452,7 @@ void CodeGenModule::EmitLegacyWasmCallbacks() {
     Canonical->addFnAttrs(
         llvm::AttrBuilder(getLLVMContext(), Body->getAttributes().getFnAttrs()));
 
-    Body->replaceUsesWithIf(Canonical, [](llvm::Use &U) {
+    Source->replaceUsesWithIf(Canonical, [](llvm::Use &U) {
       const auto *Call = dyn_cast<llvm::CallBase>(U.getUser());
       return !Call || !Call->isCallee(&U);
     });

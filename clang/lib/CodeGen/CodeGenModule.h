@@ -1293,6 +1293,13 @@ public:
   /// Give eligible legacy C callbacks one inferred WebAssembly signature.
   void EmitLegacyWasmCallbacks();
 
+  /// Preserve the provenance of source function addresses until the audit.
+  llvm::Constant *getLegacyWasmSourceAddress(const FunctionDecl *FD,
+                                           llvm::Constant *Address);
+
+  llvm::MapVector<const FunctionDecl *, llvm::GlobalAlias *>
+      LegacyWasmSourceAddresses;
+
   /// Tell the consumer that this variable has been instantiated.
   void HandleCXXStaticMemberVarInstantiation(VarDecl *VD);
 

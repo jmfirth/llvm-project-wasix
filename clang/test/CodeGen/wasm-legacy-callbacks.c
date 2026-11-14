@@ -1,36 +1,49 @@
 // RUN: split-file %s %t
 // RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/positive.c | FileCheck %s --check-prefix=P
 // RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/positive.c | FileCheck %s --check-prefix=P
-// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/negative.c | FileCheck %s --check-prefix=N --implicit-check-not=.legacy.body
-// RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/negative.c | FileCheck %s --check-prefix=N --implicit-check-not=.legacy.body
-// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/asm.c | FileCheck %s --check-prefix=ASM --implicit-check-not=.legacy.body
-// RUN: %clang_cc1 -triple x86_64-unknown-linux -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/positive.c | FileCheck %s --check-prefix=NATIVE --implicit-check-not=.legacy.body
-// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=c23 -emit-llvm -o - %t/prototyped.c | FileCheck %s --check-prefix=PROTO --implicit-check-not=.legacy.body
-// RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=c++17 -x c++ -emit-llvm -o - %t/prototyped.c | FileCheck %s --check-prefix=PROTO --implicit-check-not=.legacy.body
+// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/negative.c | FileCheck %s --check-prefix=N --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/negative.c | FileCheck %s --check-prefix=N --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/asm.c | FileCheck %s --check-prefix=ASM --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple x86_64-unknown-linux -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/positive.c | FileCheck %s --check-prefix=NATIVE --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=c23 -emit-llvm -o - %t/prototyped.c | FileCheck %s --check-prefix=PROTO --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=c++17 -x c++ -emit-llvm -o - %t/prototyped.c | FileCheck %s --check-prefix=PROTO --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu89 -Wno-implicit-int -Wno-error=incompatible-function-pointer-types -emit-llvm -disable-llvm-passes -o - %t/coverage.c | FileCheck %s --check-prefix=COVER
+// RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu89 -Wno-implicit-int -Wno-error=incompatible-function-pointer-types -emit-llvm -disable-llvm-passes -o - %t/coverage.c | FileCheck %s --check-prefix=COVER
+// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/weakref.c | FileCheck %s --check-prefix=WEAK --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/weakref.c | FileCheck %s --check-prefix=WEAK --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/asmlabel.c | FileCheck %s --check-prefix=LABEL --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/asmlabel.c | FileCheck %s --check-prefix=LABEL --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -DPRAGMA -emit-llvm -disable-llvm-passes -o - %t/asmlabel.c | FileCheck %s --check-prefix=LABEL --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu99 -DPRAGMA -emit-llvm -disable-llvm-passes -o - %t/asmlabel.c | FileCheck %s --check-prefix=LABEL --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -fregister-global-dtors-with-atexit -fno-use-cxa-atexit -emit-llvm -disable-llvm-passes -o - %t/dtor.c | FileCheck %s --check-prefix=DTOR --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu99 -fregister-global-dtors-with-atexit -fno-use-cxa-atexit -emit-llvm -disable-llvm-passes -o - %t/dtor.c | FileCheck %s --check-prefix=DTOR --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/alias.c | FileCheck %s --check-prefix=ALIAS --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/alias.c | FileCheck %s --check-prefix=ALIAS --implicit-check-not=.wasm.callback
 
 // All address expressions, including initializers, address-of, casts, and
 // comparisons, must refer to ONE canonical symbol. No API spelling selects it.
-// P-DAG: @saved = {{.*}}global ptr @thread
-// P-DAG: @addresses = {{.*}}global [2 x ptr] [ptr @thread, ptr @thread]
-// P-DAG: @pair = {{.*}}global %struct.pair { ptr @thread }
-// P-DAG: ret ptr @thread
-// P-DAG: call void @take_start(ptr {{.*}}@thread)
-// P-DAG: call void @take_signal(ptr {{.*}}@handler)
-// P-DAG: call void @take_cleanup(ptr {{.*}}@cleanup)
-// P-DAG: call void @take_once(ptr {{.*}}@initializer)
-// P-DAG: call void @take_compare(ptr {{.*}}@compare)
-// P-DAG: call void @take_exit(ptr {{.*}}@at_exit)
-// P-DAG: icmp eq ptr {{.*}}, @thread
-// P-DAG: call {{.*}}ptr @thread.legacy.body()
-// P-DAG: define internal {{.*}}ptr @thread(ptr
-// P-DAG: define internal void @handler(i32
-// P-DAG: define internal void @forward(i32
-// P-DAG: define internal void @cleanup(ptr
-// P-DAG: define internal void @initializer()
-// P-DAG: define internal {{.*}}i32 @compare(ptr {{.*}}, ptr
-// P-DAG: define internal void @at_exit()
-// P-DAG: define internal {{.*}}i8 @small(i8
-// P-DAG: call {{.*}}i8 @small.legacy.body()
+// P-DAG: @saved = {{.*}}global ptr @thread.wasm.callback
+// P-DAG: @addresses = {{.*}}global [2 x ptr] [ptr @thread.wasm.callback, ptr @thread.wasm.callback]
+// P-DAG: @pair = {{.*}}global %struct.pair { ptr @thread.wasm.callback }
+// P-DAG: ret ptr @thread.wasm.callback
+// P-DAG: call void @take_start(ptr {{.*}}@thread.wasm.callback)
+// P-DAG: call void @take_signal(ptr {{.*}}@handler.wasm.callback)
+// P-DAG: call void @take_cleanup(ptr {{.*}}@cleanup.wasm.callback)
+// P-DAG: call void @take_once(ptr {{.*}}@initializer.wasm.callback)
+// P-DAG: call void @take_compare(ptr {{.*}}@compare.wasm.callback)
+// P-DAG: call void @take_exit(ptr {{.*}}@at_exit.wasm.callback)
+// P-DAG: icmp eq ptr {{.*}}, @thread.wasm.callback
+// P-DAG: call {{.*}}ptr @thread()
+// P-DAG: define internal {{.*}}ptr @thread()
+// P-DAG: define internal {{.*}}ptr @thread.wasm.callback(ptr
+// P-DAG: define internal void @handler.wasm.callback(i32
+// P-DAG: define internal void @forward.wasm.callback(i32
+// P-DAG: define internal void @cleanup.wasm.callback(ptr
+// P-DAG: define internal void @initializer.wasm.callback()
+// P-DAG: define internal {{.*}}i32 @compare.wasm.callback(ptr {{.*}}, ptr
+// P-DAG: define internal void @at_exit.wasm.callback()
+// P-DAG: define internal {{.*}}i8 @small.wasm.callback(i8
+// P-DAG: call {{.*}}i8 @small()
 
 // N-DAG: define internal {{.*}}i32 @opaque()
 // N-DAG: call i32 %{{.*}}(i32 noundef 17)
@@ -46,7 +59,6 @@
 // N-DAG: define internal void @erased_after_prototype()
 // N-DAG: define internal void @prototype()
 // N-DAG: define internal {{.*}}ptr @direct_result()
-// N-DAG: define internal void @aliased()
 // N-DAG: define internal void @retained()
 // N-DAG: define internal void @untyped_consumer()
 // N-DAG: define internal void @vararg_consumer()
@@ -54,12 +66,37 @@
 // N-DAG: define internal void @generic_erased()
 // N-DAG: define internal void @declared_before()
 // N-DAG: define internal void @declared_after()
+// N-DAG: define internal void @roundtrip_void()
+// N-DAG: define internal void @roundtrip_unprototyped()
+// N-DAG: define internal {{.*}}i32 @direct_consumed()
+// N-DAG: define internal {{.*}}i32 @stmt_expr_consumed()
 
 // ASM: define internal void @with_asm()
 // NATIVE: define internal {{.*}}ptr @thread()
 // PROTO: define{{.*}}i32 @{{.*}}ordinary
 
+// COVER-DAG: @designated = {{.*}}global {{.*}}{ i32 1, {{.*}}ptr @tick.wasm.callback }
+// COVER-DAG: @array = {{.*}}global [2 x ptr] [ptr @tick.wasm.callback, ptr null]
+// COVER-DAG: define internal {{.*}}i32 @onintr()
+// COVER-DAG: call {{.*}}i32 @onintr()
+// COVER-DAG: define internal void @onintr.wasm.callback(i32
+// COVER-DAG: define internal void @tick.wasm.callback(i32
+// COVER-DAG: define internal void @left.wasm.callback(i32
+// COVER-DAG: define internal void @right.wasm.callback(i32
+// COVER-DAG: define internal void @addr_left.wasm.callback(i32
+// COVER-DAG: define internal void @addr_right.wasm.callback(i32
+// COVER-DAG: define internal void @condition.wasm.callback(i32
+// WEAK: store volatile ptr @worker,
+// LABEL: store volatile ptr @worker,
+// DTOR: call {{.*}}i32 @atexit(ptr @worker)
+// ALIAS: @alias_name = internal alias void (), ptr @aliased
+
 //--- positive.c
+// System headers can contain redirects unrelated to the audited callbacks.
+extern int redirected(void) __asm__("unrelated_redirect_target");
+static void unrelated(void) {}
+static void unrelated_weak(void) __attribute__((weakref("unrelated")));
+static void unrelated_alias(void) __attribute__((alias("unrelated")));
 typedef void *(*start_type)(void *);
 extern void take_start(start_type);
 extern void take_signal(void (*)(int));
@@ -126,8 +163,6 @@ static void erased() {}
 static void erased_after_prototype() {}
 static void prototype(void) {}
 static void *direct_result() { return (void *)1; }
-static void aliased() {}
-static void alias_name() __attribute__((alias("aliased")));
 static void retained() __attribute__((used));
 static void retained() {}
 static void untyped_consumer() {}
@@ -138,6 +173,24 @@ static void declared_before(void);
 static void declared_before() {}
 static void declared_after() {}
 static void declared_after(void);
+static void roundtrip_void() {}
+static void roundtrip_unprototyped() {}
+static int direct_consumed() { return 42; }
+static int stmt_expr_consumed() { return 43; }
+int consume_stmt_expr_result(void) {
+  take_int((void (*)(int))stmt_expr_consumed);
+  return ({ stmt_expr_consumed(); });
+}
+int consume_direct_result(void) {
+  take_int((void (*)(int))direct_consumed);
+  return direct_consumed();
+}
+void visible_roundtrips(void) {
+  take_int(roundtrip_void);
+  ((void (*)(void))(void (*)(int))roundtrip_void)();
+  take_int(roundtrip_unprototyped);
+  ((void (*)())(void (*)(int))roundtrip_unprototyped)();
+}
 void *negative(void) {
   take_int(conflict);
   take_pointer(conflict);
@@ -154,8 +207,6 @@ void *negative(void) {
   unknown((void *)(void (*)(int))erased_after_prototype);
   take_int((void (*)(int))prototype);
   take_void((void (*)(void))direct_result);
-  take_int(aliased);
-  take_int(alias_name);
   take_int(retained);
   take_int(untyped_consumer);
   take_untyped((void (*)(int))untyped_consumer);
@@ -180,4 +231,77 @@ static int callback(void) { return 1; }
 int ordinary(void) {
   int (*volatile fp)(void) = callback;
   return fp();
+}
+
+//--- coverage.c
+typedef void (*slot)(int);
+extern void take(slot);
+static void tick() {}
+struct ops { int id; slot on; };
+struct ops designated = {.on = tick, .id = 1};
+slot array[2] = {[0] = tick};
+static onintr() { return 0; }
+static void left() {}
+static void right() {}
+static void addr_left() {}
+static void addr_right() {}
+static void condition() {}
+int coverage(slot local, int n) {
+  if (n < 0) onintr();
+  (void)onintr();
+  ({ onintr(); });
+  n ? onintr() : 0;
+  switch (n) {
+  case 0: onintr(); break;
+  default: onintr();
+  }
+label: onintr();
+  take(onintr);
+  take(left);
+  take(right);
+  take(addr_left);
+  take(addr_right);
+  take(condition ? condition : condition);
+  return (left == local) + (local == right) +
+         (&addr_left != local) + (local != &addr_right);
+}
+
+//--- weakref.c
+extern void take(void (*)(int));
+static void worker() {}
+static void alt(void) __attribute__((weakref("worker")));
+void weakref_use(void) {
+  void (*volatile f)(void) = alt;
+  take(worker);
+  f();
+}
+
+//--- asmlabel.c
+extern void take(void (*)(int));
+static void worker() {}
+#ifdef PRAGMA
+#pragma redefine_extname alt worker
+extern void alt(void);
+#else
+extern void alt(void) __asm__("worker");
+#endif
+void label_use(void) {
+  void (*volatile f)(void) = alt;
+  take(worker);
+  f();
+}
+
+//--- dtor.c
+extern void take(void (*)(int));
+static void worker() __attribute__((destructor));
+static void worker() {}
+void install(void) { take(worker); }
+
+//--- alias.c
+extern void take(void (*)(int));
+static void aliased() {}
+static void alias_name(void) __attribute__((alias("aliased")));
+void install_alias(void) {
+  take(aliased);
+  take((void (*)(int))alias_name);
 }

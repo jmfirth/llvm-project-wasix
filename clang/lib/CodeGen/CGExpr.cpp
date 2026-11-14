@@ -3317,6 +3317,7 @@ static LValue EmitFunctionDeclLValue(CodeGenFunction &CGF, const Expr *E,
                                      GlobalDecl GD) {
   const FunctionDecl *FD = cast<FunctionDecl>(GD.getDecl());
   llvm::Constant *V = CGF.CGM.getFunctionPointer(GD);
+  V = CGF.CGM.getLegacyWasmSourceAddress(FD, V);
   QualType ETy = E->getType();
   if (ETy->isCFIUncheckedCalleeFunctionType()) {
     if (auto *GV = dyn_cast<llvm::GlobalValue>(V))

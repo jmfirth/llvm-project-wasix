@@ -9,8 +9,12 @@
 // WebAssembly indirect calls require an exact signature. For an internal C
 // definition with an empty parameter list, infer a single callback prototype
 // from ALL its address uses while the source types are still available. Only
-// ignored scalar arguments and an ignored scalar result can be adapted. Unknown
-// escapes and conflicting prototypes keep the ordinary, strict call behavior.
+// ignored scalar arguments can be adapted; the return type must match exactly.
+// Unknown escapes and conflicting prototypes keep the strict call behavior.
+// Production IR is always constructed by stock CodeGen. A separate audit module
+// carries source provenance, and must match production IR exactly after its
+// tags are removed before any candidate can be adapted. Rejected and
+// non-candidate translation units therefore remain byte-identical to stock.
 // There is no false success: the only new failures are loud traps of calls at
 // the function's own type through an invisible round trip (e.g. through memory).
 // A visible conversion back to that type rejects the candidate.
@@ -47,7 +51,6 @@ public:
     const FunctionDecl *Definition = nullptr;
     QualType Prototype;
     bool Reject = false;
-    bool ConsumesDirectResult = false;
   };
 
   // AST visitation order, rather than pointer hash order, determines IR order.
@@ -73,64 +76,6 @@ public:
     if (const auto *A = FD->getAttr<AsmLabelAttr>())
       Record(A->getLabel());
     return true;
-  }
-
-  bool discardsResult(const Expr *E) {
-    DynTypedNode Node = DynTypedNode::create(*E);
-    for (;;) {
-      auto Parents = Context.getParents(Node);
-      if (Parents.size() != 1)
-        return false;
-      Node = Parents[0];
-      if (const auto *P = Node.get<ParenExpr>()) {
-        E = P;
-        continue;
-      }
-      if (const auto *Cast = Node.get<CastExpr>())
-        return Cast->getType()->isVoidType();
-      if (const auto *B = Node.get<BinaryOperator>()) {
-        if (B->getOpcode() != BO_Comma)
-          return false;
-        if (B->getLHS() == E)
-          return true;
-        E = B;
-        continue;
-      }
-      if (const auto *C = Node.get<ConditionalOperator>()) {
-        if (C->getCond() == E)
-          return false;
-        E = C;
-        continue;
-      }
-      if (const auto *S = Node.get<CompoundStmt>()) {
-        // The last expression of a GNU statement expression can supply a
-        // consumed result; ordinary expression statements discard theirs.
-        if (!S->body_empty() && S->body_back() == E) {
-          auto Outer = Context.getParents(Node);
-          if (Outer.size() == 1)
-            if (const auto *StatementExpr = Outer[0].get<StmtExpr>()) {
-              E = StatementExpr;
-              Node = Outer[0];
-              continue;
-            }
-        }
-        return true;
-      }
-      if (Node.get<LabelStmt>() || Node.get<SwitchCase>() ||
-          Node.get<AttributedStmt>())
-        return true;
-      if (const auto *S = Node.get<IfStmt>())
-        return S->getThen() == E || S->getElse() == E;
-      if (const auto *S = Node.get<WhileStmt>())
-        return S->getBody() == E;
-      if (const auto *S = Node.get<DoStmt>())
-        return S->getBody() == E;
-      if (const auto *S = Node.get<ForStmt>())
-        return S->getInit() == E || S->getInc() == E || S->getBody() == E;
-      if (const auto *S = Node.get<SwitchStmt>())
-        return S->getBody() == E;
-      return false;
-    }
   }
 
   bool VisitGCCAsmStmt(GCCAsmStmt *) {
@@ -242,7 +187,6 @@ public:
         if (Call->getCallee() == Current && Call->getDirectCallee() &&
             Call->getDirectCallee()->getCanonicalDecl() ==
                 FD->getCanonicalDecl()) {
-          C.ConsumesDirectResult |= !discardsResult(Call);
           return true;
         }
         // A typed cast passed to an unprototyped or variadic consumer is
@@ -309,11 +253,14 @@ bool isScalarABIType(QualType T) {
 }
 
 // Every address reachable through Source was emitted by a source expression
-// covered by the AST audit. All other body uses must be direct call operands,
-// including instruction uses: CodeGen can synthesize stores and call arguments.
+// covered by the AST audit. Other body uses must be direct callees or pointer
+// comparisons. Comparisons cannot invoke the function, and acquire its
+// canonical address on adaptation. Synthesized stores/call arguments reject.
 bool hasUnauditedBodyUse(llvm::Function *Body, llvm::GlobalAlias *Source) {
   for (llvm::Use &U : Body->uses()) {
     if (U.getUser() == Source)
+      continue;
+    if (isa<llvm::ICmpInst>(U.getUser()))
       continue;
     const auto *Call = dyn_cast<llvm::CallBase>(U.getUser());
     if (!Call || !Call->isCallee(&U))
@@ -344,8 +291,8 @@ bool hasUnauditedIRUse(llvm::Value *V,
 
 llvm::Constant *CodeGenModule::getLegacyWasmSourceAddress(
     const FunctionDecl *FD, llvm::Constant *Address) {
-  if (!getTriple().isWasm() || LangOpts.CPlusPlus || LangOpts.C23 ||
-      !LangOpts.Sanitize.empty() || !FD->getType()->isFunctionNoProtoType() ||
+  if (!LegacyWasmSourceAddressTagging ||
+      !FD->getType()->isFunctionNoProtoType() ||
       FD->getNumParams() || FD->getFormalLinkage() != Linkage::Internal)
     return Address;
   auto *Body = dyn_cast<llvm::Function>(Address);
@@ -360,108 +307,129 @@ llvm::Constant *CodeGenModule::getLegacyWasmSourceAddress(
   return Source;
 }
 
-void CodeGenModule::EmitLegacyWasmCallbacks() {
-  // These transient aliases only distinguish source addresses from synthesized
-  // uses during CodeGen. They never survive Release(), even for rejected TUs.
-  SourceAddressCleanup RestoreSourceAddresses{LegacyWasmSourceAddresses};
-  // Sanitizer type/entry instrumentation is tied to the source signature.
-  // Leave it strict until wrappers participate in that instrumentation too.
-  if (!getTriple().isWasm() || LangOpts.CPlusPlus || LangOpts.C23 ||
-      !LangOpts.Sanitize.empty() ||
-      !getModule().getModuleInlineAsm().empty())
+void CodeGenModule::EmitLegacyWasmCallbacks(CodeGenModule &Audit) {
+  struct Adaptation {
+    std::string Symbol;
+    QualType Prototype;
+  };
+  llvm::SmallVector<Adaptation, 8> Adaptations;
+  {
+    // Aliases exist only in the disposable audit module, never in production
+    // CodeGen. Even an IR-level rejection cannot perturb stock construction.
+    SourceAddressCleanup RestoreSourceAddresses{Audit.LegacyWasmSourceAddresses};
+    if (!getModule().getModuleInlineAsm().empty())
+      return;
+
+    LegacyCallbackUses Uses(Context);
+    Uses.TraverseDecl(Context.getTranslationUnitDecl());
+    if (Uses.HasAsm)
+      return;
+    for (auto &Entry : Uses.Candidates) {
+      auto &C = Entry.second;
+      if (C.Reject || C.Prototype.isNull())
+        continue;
+      if (getCodeGenOpts().RegisterGlobalDtorsWithAtExit &&
+          llvm::any_of(C.Definition->redecls(), [](const FunctionDecl *R) {
+            return R->hasAttr<DestructorAttr>() || R->hasAttr<ConstructorAttr>();
+          }))
+        continue;
+      const auto *Prototype = C.Prototype->castAs<FunctionProtoType>();
+      if (Prototype->isVariadic() || Prototype->getCallConv() != CC_C ||
+          Prototype->hasExtParameterInfos() ||
+          !llvm::all_of(Prototype->param_types(), isScalarABIType))
+        continue;
+      QualType OldReturn = C.Definition->getReturnType();
+      if ((!OldReturn->isVoidType() && !isScalarABIType(OldReturn)) ||
+          !Context.hasSameType(OldReturn, Prototype->getReturnType()))
+        continue;
+      auto *Body = Audit.getModule().getFunction(
+          Audit.getMangledName(GlobalDecl(C.Definition)));
+      if (!Body || Body->isDeclaration() || !Body->hasInternalLinkage() ||
+          Body->arg_size() || Body->isVarArg() ||
+          Body->getCallingConv() != llvm::CallingConv::C ||
+          Body->getAddressSpace() != 0 ||
+          Body->hasFnAttribute("wasm-export-name"))
+        continue;
+      StringRef BodyName = Body->getName();
+      BodyName.consume_front("\\01");
+      if (Uses.AlternateNames.contains(BodyName))
+        continue;
+      auto *Source = Audit.LegacyWasmSourceAddresses.lookup(Entry.first);
+      auto IsBody = [Body, Source](const llvm::WeakTrackingVH &V) {
+        return static_cast<llvm::Value *>(V) == Body ||
+               static_cast<llvm::Value *>(V) == Source;
+      };
+      if (llvm::any_of(Audit.LLVMUsed, IsBody) ||
+          llvm::any_of(Audit.LLVMCompilerUsed, IsBody))
+        continue;
+      llvm::SmallPtrSet<llvm::Value *, 8> Seen;
+      if (!Source || hasUnauditedBodyUse(Body, Source) ||
+          hasUnauditedIRUse(Source, Seen))
+        continue;
+
+      const CGFunctionInfo &Info = Audit.getTypes().arrangeFreeFunctionType(
+          Context.getCanonicalType(C.Prototype).castAs<FunctionProtoType>());
+      // Source scalars can still require indirect ABI lowering.
+      if ((!Info.getReturnInfo().isDirect() &&
+           !Info.getReturnInfo().isExtend() &&
+           !Info.getReturnInfo().isIgnore()) ||
+          !llvm::all_of(Info.arguments(), [](const auto &A) {
+            return A.info.isDirect() || A.info.isExtend();
+          }))
+        continue;
+      llvm::FunctionType *FT = Audit.getTypes().GetFunctionType(Info);
+      if (FT->getNumParams() != Prototype->getNumParams() ||
+          FT->getReturnType() != Body->getReturnType() ||
+          FT == Body->getFunctionType())
+        continue;
+      Adaptations.push_back({Body->getName().str(), C.Prototype});
+    }
+  }
+  if (Adaptations.empty())
     return;
 
-  LegacyCallbackUses Uses(Context);
-  Uses.TraverseDecl(Context.getTranslationUnitDecl());
-  if (Uses.HasAsm)
+  // Stock folding, non-prototype callee repair, metadata, and every other
+  // CodeGen decision must agree, not just the candidate's signature or uses.
+  // If the provenance tags affected construction, leave the stock module alone.
+  std::string StockIR, AuditIR;
+  llvm::raw_string_ostream StockStream(StockIR), AuditStream(AuditIR);
+  getModule().print(StockStream, nullptr);
+  Audit.getModule().print(AuditStream, nullptr);
+  if (StockIR != AuditIR)
     return;
-  for (auto &Entry : Uses.Candidates) {
-    auto &C = Entry.second;
-    if (C.Reject || C.Prototype.isNull())
-      continue;
-    if (getCodeGenOpts().RegisterGlobalDtorsWithAtExit &&
-        llvm::any_of(C.Definition->redecls(), [](const FunctionDecl *R) {
-          return R->hasAttr<DestructorAttr>() || R->hasAttr<ConstructorAttr>();
-        }))
-      continue;
-    const auto *Prototype = C.Prototype->castAs<FunctionProtoType>();
-    if (Prototype->isVariadic() || Prototype->getCallConv() != CC_C ||
-        Prototype->hasExtParameterInfos() ||
-        !llvm::all_of(Prototype->param_types(), isScalarABIType))
-      continue;
 
-    QualType OldReturn = C.Definition->getReturnType();
-    QualType NewReturn = Prototype->getReturnType();
-    bool Discard = NewReturn->isVoidType() && isScalarABIType(OldReturn);
-    if ((!OldReturn->isVoidType() && !isScalarABIType(OldReturn)) ||
-        (!Context.hasSameType(OldReturn, NewReturn) &&
-         (!Discard || C.ConsumesDirectResult)))
-      continue;
-    auto *Body = getModule().getFunction(getMangledName(GlobalDecl(C.Definition)));
-    if (!Body || Body->isDeclaration() || !Body->hasInternalLinkage() ||
-        Body->arg_size() || Body->isVarArg() ||
-        Body->getCallingConv() != llvm::CallingConv::C ||
-        Body->getAddressSpace() != 0 ||
-        Body->hasFnAttribute("wasm-export-name"))
-      continue;
-    StringRef BodyName = Body->getName();
-    BodyName.consume_front("\01");
-    if (Uses.AlternateNames.contains(BodyName))
-      continue;
-    // These lists are materialized by emitLLVMUsed() later in Release().
-    // They can contain compiler-generated uses with no DeclRefExpr.
-    auto *Source = LegacyWasmSourceAddresses.lookup(Entry.first);
-    auto IsBody = [Body, Source](const llvm::WeakTrackingVH &V) {
-      return static_cast<llvm::Value *>(V) == Body ||
-             static_cast<llvm::Value *>(V) == Source;
-    };
-    if (llvm::any_of(LLVMUsed, IsBody) || llvm::any_of(LLVMCompilerUsed, IsBody))
-      continue;
-    llvm::SmallPtrSet<llvm::Value *, 8> Seen;
-    if (!Source || hasUnauditedBodyUse(Body, Source) ||
-        hasUnauditedIRUse(Source, Seen))
-      continue;
-
+  for (const auto &A : Adaptations) {
+    auto *Body = getModule().getFunction(A.Symbol);
     const CGFunctionInfo &Info = getTypes().arrangeFreeFunctionType(
-        Context.getCanonicalType(C.Prototype).castAs<FunctionProtoType>());
-    // Source scalars can still require indirect ABI lowering (e.g. wide
-    // integers). Do not accidentally manufacture sret/byval/padding adapters.
-    if ((!Info.getReturnInfo().isDirect() &&
-         !Info.getReturnInfo().isExtend() &&
-         !Info.getReturnInfo().isIgnore()) ||
-        !llvm::all_of(Info.arguments(), [](const auto &A) {
-          return A.info.isDirect() || A.info.isExtend();
-        }))
-      continue;
+        Context.getCanonicalType(A.Prototype).castAs<FunctionProtoType>());
     llvm::FunctionType *FT = getTypes().GetFunctionType(Info);
-    if (FT->getNumParams() != Prototype->getNumParams() ||
-        (!Discard && FT->getReturnType() != Body->getReturnType()) ||
-        FT == Body->getFunctionType())
-      continue;
-
-    std::string Symbol = Body->getName().str();
     auto *Canonical = llvm::Function::Create(
-        FT, llvm::GlobalValue::InternalLinkage, Symbol + ".wasm.callback",
+        FT, llvm::GlobalValue::InternalLinkage, A.Symbol + ".wasm.callback",
         getModule());
     llvm::AttributeList ABIAttrs;
     unsigned CallingConv;
-    ConstructAttributeList(Symbol, Info, CGCalleeInfo(), ABIAttrs, CallingConv,
+    ConstructAttributeList(A.Symbol, Info, CGCalleeInfo(), ABIAttrs, CallingConv,
                            /*AttrOnCallSite=*/false, /*IsThunk=*/true);
     Canonical->setCallingConv(CallingConv);
     Canonical->setAttributes(ABIAttrs);
     Canonical->addFnAttrs(
         llvm::AttrBuilder(getLLVMContext(), Body->getAttributes().getFnAttrs()));
 
-    Source->replaceUsesWithIf(Canonical, [](llvm::Use &U) {
+    Body->replaceUsesWithIf(Canonical, [](llvm::Use &U) {
       const auto *Call = dyn_cast<llvm::CallBase>(U.getUser());
       return !Call || !Call->isCallee(&U);
     });
+    // Keep the user's symbol as the innermost frame at every optimization
+    // level. Apply this only after adaptation, and only to the original body.
+    Body->removeFnAttr(llvm::Attribute::AlwaysInline);
+    Body->removeFnAttr(llvm::Attribute::InlineHint);
+    Body->addFnAttr(llvm::Attribute::NoInline);
     auto *BB = llvm::BasicBlock::Create(getLLVMContext(), "entry", Canonical);
     llvm::IRBuilder<> Builder(BB);
     auto *Call = Builder.CreateCall(Body->getFunctionType(), Body);
     Call->setCallingConv(Body->getCallingConv());
     Call->setAttributes(Body->getAttributes());
-    if (NewReturn->isVoidType())
+    if (A.Prototype->castAs<FunctionProtoType>()->getReturnType()->isVoidType())
       Builder.CreateRetVoid();
     else
       Builder.CreateRet(Call);

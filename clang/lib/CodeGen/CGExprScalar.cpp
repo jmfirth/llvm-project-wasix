@@ -43,6 +43,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GEPNoWrapFlags.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
+#include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsPowerPC.h"
@@ -65,6 +66,16 @@ extern cl::opt<bool> EnableSingleByteCoverage;
 } // namespace llvm
 
 namespace {
+
+// Provenance tags must not inhibit stock constant folding of pointer tests.
+// Comparisons cannot invoke a callback; surviving icmp operands are audited
+// separately and acquire the canonical address only if adaptation succeeds.
+Value *legacyCallbackComparisonOperand(CodeGenModule &CGM, Value *V) {
+  for (const auto &Entry : CGM.LegacyWasmSourceAddresses)
+    if (V == Entry.second)
+      return Entry.second->getAliasee();
+  return V;
+}
 
 /// Determine whether the given binary operation may overflow.
 /// Sets \p Result to the value of the operation for BO_Add, BO_Sub, BO_Mul,
@@ -420,6 +431,7 @@ public:
 
   /// EmitPointerToBoolConversion - Perform a pointer to boolean conversion.
   Value *EmitPointerToBoolConversion(Value *V, QualType QT) {
+    V = legacyCallbackComparisonOperand(CGF.CGM, V);
     Value *Zero = CGF.CGM.getNullPointer(cast<llvm::PointerType>(V->getType()), QT);
 
     return Builder.CreateICmpNE(V, Zero, "tobool");
@@ -5074,8 +5086,8 @@ Value *ScalarExprEmitter::EmitCompare(const BinaryOperator *E,
                    CGF, LHS, RHS, MPT, E->getOpcode() == BO_NE);
   } else if (!LHSTy->isAnyComplexType() && !RHSTy->isAnyComplexType()) {
     BinOpInfo BOInfo = EmitBinOps(E);
-    Value *LHS = BOInfo.LHS;
-    Value *RHS = BOInfo.RHS;
+    Value *LHS = legacyCallbackComparisonOperand(CGF.CGM, BOInfo.LHS);
+    Value *RHS = legacyCallbackComparisonOperand(CGF.CGM, BOInfo.RHS);
 
     // If AltiVec, the comparison results in a numeric type, so we use
     // intrinsics comparing vectors and giving 0 or 1 as a result

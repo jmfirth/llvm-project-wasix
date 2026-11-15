@@ -1291,12 +1291,13 @@ public:
   void EmitMainVoidAlias();
 
   /// Give eligible legacy C callbacks one inferred WebAssembly signature.
-  void EmitLegacyWasmCallbacks();
+  void EmitLegacyWasmCallbacks(CodeGenModule &Audit);
 
   /// Preserve the provenance of source function addresses until the audit.
   llvm::Constant *getLegacyWasmSourceAddress(const FunctionDecl *FD,
                                            llvm::Constant *Address);
 
+  bool LegacyWasmSourceAddressTagging = false;
   llvm::MapVector<const FunctionDecl *, llvm::GlobalAlias *>
       LegacyWasmSourceAddresses;
 

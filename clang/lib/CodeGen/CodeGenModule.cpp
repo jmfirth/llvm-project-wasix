@@ -1018,7 +1018,6 @@ void CodeGenModule::Release() {
   emitAtAvailableLinkGuard();
   if (Context.getTargetInfo().getTriple().isWasm()) {
     EmitMainVoidAlias();
-    EmitLegacyWasmCallbacks();
   }
 
   if (getTriple().isAMDGPU() ||

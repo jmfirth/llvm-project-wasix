@@ -291,12 +291,17 @@ bool hasUnauditedIRUse(llvm::Value *V,
 
 llvm::Constant *CodeGenModule::getLegacyWasmSourceAddress(
     const FunctionDecl *FD, llvm::Constant *Address) {
-  if (!LegacyWasmSourceAddressTagging ||
-      !FD->getType()->isFunctionNoProtoType() ||
+  if (!FD->getType()->isFunctionNoProtoType() ||
       FD->getNumParams() || FD->getFormalLinkage() != Linkage::Internal)
     return Address;
   auto *Body = dyn_cast<llvm::Function>(Address);
   if (!Body)
+    return Address;
+  // Every audit source alias is created here. Record the same eligibility in
+  // stock CodeGen before returning its untouched address, so candidate-free
+  // translation units never need a replay.
+  SawLegacyWasmCandidateAddress = true;
+  if (!LegacyWasmSourceAddressTagging)
     return Address;
   auto &Source = LegacyWasmSourceAddresses[FD->getCanonicalDecl()];
   if (!Source)
@@ -411,6 +416,7 @@ void CodeGenModule::EmitLegacyWasmCallbacks(CodeGenModule &Audit) {
     ConstructAttributeList(A.Symbol, Info, CGCalleeInfo(), ABIAttrs, CallingConv,
                            /*AttrOnCallSite=*/false, /*IsThunk=*/true);
     Canonical->setCallingConv(CallingConv);
+    Canonical->setSection(Body->getSection());
     Canonical->setAttributes(ABIAttrs);
     Canonical->addFnAttrs(
         llvm::AttrBuilder(getLLVMContext(), Body->getAttributes().getFnAttrs()));

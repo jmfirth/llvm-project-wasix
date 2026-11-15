@@ -24,6 +24,14 @@
 // RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/rejected.c | FileCheck %s --check-prefix=REJECTED --implicit-check-not=.wasm.callback --implicit-check-not="internal alias"
 // RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -O2 -emit-llvm -o - %t/positive.c | FileCheck %s --check-prefix=OPT
 // RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu99 -O2 -emit-llvm -o - %t/positive.c | FileCheck %s --check-prefix=OPT
+// RUN: %clang_cc1 -triple wasm32-unknown-wasi -x objective-c -fobjc-runtime=gnustep-1.8 -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/positive.c | FileCheck %s --check-prefix=NATIVE --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm64-unknown-wasi -x objective-c -fobjc-runtime=gnustep-1.8 -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/positive.c | FileCheck %s --check-prefix=NATIVE --implicit-check-not=.wasm.callback
+// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/section.c | FileCheck %s --check-prefix=SECTION
+// RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu99 -emit-llvm -disable-llvm-passes -o - %t/section.c | FileCheck %s --check-prefix=SECTION
+// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -verify -emit-llvm -disable-llvm-passes -o - %t/diagnostics.c | FileCheck %s --check-prefix=DIAG
+// RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu99 -verify -emit-llvm -disable-llvm-passes -o - %t/diagnostics.c | FileCheck %s --check-prefix=DIAG
+// RUN: %clang_cc1 -triple wasm32-unknown-wasi -std=gnu99 -Werror -DAUDIT_ERROR -emit-llvm -disable-llvm-passes -o - %t/diagnostics.c | FileCheck %s --check-prefix=AUDIT-ERROR --implicit-check-not=.wasm.callback --implicit-check-not="internal alias"
+// RUN: %clang_cc1 -triple wasm64-unknown-wasi -std=gnu99 -Werror -DAUDIT_ERROR -emit-llvm -disable-llvm-passes -o - %t/diagnostics.c | FileCheck %s --check-prefix=AUDIT-ERROR --implicit-check-not=.wasm.callback --implicit-check-not="internal alias"
 
 // All address expressions, including initializers, address-of, casts, and
 // comparisons, must refer to ONE canonical symbol. No API spelling selects it.
@@ -105,6 +113,12 @@
 // LABEL: store volatile ptr @worker,
 // DTOR: call {{.*}}i32 @atexit(ptr @worker)
 // ALIAS: @alias_name = internal alias void (), ptr @aliased
+// SECTION-DAG: define internal void @section_worker() {{.*}}section ".text.callback"
+// SECTION-DAG: define internal void @section_worker.wasm.callback(i32 {{.*}}section ".text.callback"
+// DIAG: call void @take(ptr {{.*}}@warning_worker.wasm.callback)
+// DIAG: define internal void @warning_worker.wasm.callback(i32
+// AUDIT-ERROR: call void @take(ptr {{.*}}@warning_worker)
+// AUDIT-ERROR: define internal void @warning_worker()
 
 //--- positive.c
 // System headers can contain redirects unrelated to the audited callbacks.
@@ -334,4 +348,28 @@ int fold(void) {
 int cast_call(void) {
   ((void (*)(int))d)(1);
   return ((int (*)(int, int))e)(1, 2);
+}
+
+//--- section.c
+#pragma clang section text = ".text.callback"
+static void section_worker() {}
+#pragma clang section text = ""
+extern void take(void (*)(int));
+void install_section(void) { take(section_worker); }
+
+//--- diagnostics.c
+extern void take(void (*)(int));
+static void warning_worker() {}
+struct big { char c[32]; };
+struct big value;
+// Command-line warning policy is replayed, but source pragma mappings belong
+// to the production engine. With -Werror the audit alone errors here; it must
+// reject adaptation without failing the successful stock compilation.
+#ifdef AUDIT_ERROR
+#pragma clang diagnostic ignored "-Watomic-alignment"
+#endif
+void install_warning(void) {
+  take(warning_worker);
+  struct big result;
+  __atomic_load(&value, &result, __ATOMIC_SEQ_CST); // expected-warning {{misaligned atomic operation}} expected-warning {{large atomic operation}}
 }

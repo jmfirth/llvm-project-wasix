@@ -180,7 +180,8 @@ namespace {
 
       Builder->LegacyWasmSourceAddressTagging = IsLegacyCallbackAudit;
       if (!IsLegacyCallbackAudit && Context.getTargetInfo().getTriple().isWasm() &&
-          !Context.getLangOpts().CPlusPlus && !Context.getLangOpts().C23 &&
+          !Context.getLangOpts().CPlusPlus && !Context.getLangOpts().ObjC &&
+          !Context.getLangOpts().C23 &&
           Context.getLangOpts().Sanitize.empty() &&
           !Context.getLangOpts().IncrementalExtensions) {
         RecordLegacyCallbacks = true;
@@ -346,26 +347,35 @@ namespace {
       if (!Diags.hasUnrecoverableErrorOccurred() && Builder)
         Builder->Release();
 
-      if (RecordLegacyCallbacks && !Diags.hasErrorOccurred() && M) {
+      if (RecordLegacyCallbacks && Builder->SawLegacyWasmCandidateAddress &&
+          !Diags.hasErrorOccurred() && M) {
         // Stock CodeGen is complete. Lazy AST/PCH callbacks from replay must
         // not emit into its module, including during the final AST audit.
         ReplayingLegacyCallbacks = true;
+        // Replay diagnostics must never reach the production consumer or its
+        // error state. An audit-only error simply keeps the stock module.
+        DiagnosticsEngine AuditDiags(Diags.getDiagnosticIDs(),
+                                     Diags.getDiagnosticOptions(),
+                                     new IgnoringDiagConsumer);
+        AuditDiags.setSourceManager(&Ctx.getSourceManager());
+        ProcessWarningOptions(AuditDiags, Diags.getDiagnosticOptions(), *FS,
+                              /*ReportDiags=*/false);
         LegacyCallbackContext = std::make_unique<llvm::LLVMContext>();
         LegacyCallbackAudit = std::make_unique<CodeGeneratorImpl>(
-            Diags, M->getModuleIdentifier(), FS, HeaderSearchOpts,
+            AuditDiags, M->getModuleIdentifier(), FS, HeaderSearchOpts,
             PreprocessorOpts, CodeGenOpts, *LegacyCallbackContext, CoverageInfo,
             /*IsLegacyCallbackAudit=*/true);
         LegacyCallbackAudit->Initialize(Ctx);
         for (const auto &Emit : LegacyCallbackEvents)
           Emit();
         LegacyCallbackAudit->HandleTranslationUnit(Ctx);
-        if (!Diags.hasErrorOccurred() && M && LegacyCallbackAudit->M)
+        if (!AuditDiags.hasErrorOccurred() && LegacyCallbackAudit->M)
           Builder->EmitLegacyWasmCallbacks(*LegacyCallbackAudit->Builder);
-        LegacyCallbackEvents.clear();
         LegacyCallbackAudit.reset();
         LegacyCallbackContext.reset();
         ReplayingLegacyCallbacks = false;
       }
+      LegacyCallbackEvents.clear();
 
       // If there are errors before or when releasing the Builder, reset
       // the module to stop here before invoking the backend.

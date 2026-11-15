@@ -1298,6 +1298,7 @@ public:
                                            llvm::Constant *Address);
 
   bool LegacyWasmSourceAddressTagging = false;
+  bool SawLegacyWasmCandidateAddress = false;
   llvm::MapVector<const FunctionDecl *, llvm::GlobalAlias *>
       LegacyWasmSourceAddresses;
 

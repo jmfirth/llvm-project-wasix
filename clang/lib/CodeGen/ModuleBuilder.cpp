@@ -26,6 +26,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/VirtualFileSystem.h"
+#include <functional>
 #include <memory>
 
 using namespace clang;
@@ -65,6 +66,15 @@ namespace {
     std::unique_ptr<CodeGen::CodeGenModule> Builder;
     SmallVector<FunctionDecl *, 8> DeferredInlineMemberFuncDefs;
 
+    // Keep production CodeGen stock. Provenance aliases live in a separate
+    // context/module whose restored IR must exactly match before adaptation.
+    bool IsLegacyCallbackAudit;
+    bool RecordLegacyCallbacks = false;
+    bool ReplayingLegacyCallbacks = false;
+    SmallVector<std::function<void()>, 16> LegacyCallbackEvents;
+    std::unique_ptr<llvm::LLVMContext> LegacyCallbackContext;
+    std::unique_ptr<CodeGeneratorImpl> LegacyCallbackAudit;
+
     static llvm::StringRef ExpandModuleName(llvm::StringRef ModuleName,
                                             const CodeGenOptions &CGO) {
       if (ModuleName == "-" && !CGO.MainFileName.empty())
@@ -78,11 +88,13 @@ namespace {
                       const HeaderSearchOptions &HSO,
                       const PreprocessorOptions &PPO, const CodeGenOptions &CGO,
                       llvm::LLVMContext &C,
-                      CoverageSourceInfo *CoverageInfo = nullptr)
+                      CoverageSourceInfo *CoverageInfo = nullptr,
+                      bool IsLegacyCallbackAudit = false)
         : Diags(diags), Ctx(nullptr), FS(std::move(FS)), HeaderSearchOpts(HSO),
           PreprocessorOpts(PPO), CodeGenOpts(CGO), HandlingTopLevelDecls(0),
           CoverageInfo(CoverageInfo),
-          M(new llvm::Module(ExpandModuleName(ModuleName, CGO), C)) {
+          M(new llvm::Module(ExpandModuleName(ModuleName, CGO), C)),
+          IsLegacyCallbackAudit(IsLegacyCallbackAudit) {
       C.setDiscardValueNames(CGO.DiscardValueNames);
     }
 
@@ -166,6 +178,15 @@ namespace {
                                                PreprocessorOpts, CodeGenOpts,
                                                *M, Diags, CoverageInfo));
 
+      Builder->LegacyWasmSourceAddressTagging = IsLegacyCallbackAudit;
+      if (!IsLegacyCallbackAudit && Context.getTargetInfo().getTriple().isWasm() &&
+          !Context.getLangOpts().CPlusPlus && !Context.getLangOpts().ObjC &&
+          !Context.getLangOpts().C23 &&
+          Context.getLangOpts().Sanitize.empty() &&
+          !Context.getLangOpts().IncrementalExtensions) {
+        RecordLegacyCallbacks = true;
+      }
+
       for (auto &&Lib : CodeGenOpts.DependentLibraries)
         Builder->AddDependentLib(Lib);
       for (auto &&Opt : CodeGenOpts.LinkerOptions)
@@ -173,6 +194,9 @@ namespace {
     }
 
     void HandleCXXStaticMemberVarInstantiation(VarDecl *VD) override {
+      if (ReplayingLegacyCallbacks)
+        return;
+
       if (Diags.hasErrorOccurred())
         return;
 
@@ -180,6 +204,9 @@ namespace {
     }
 
     bool HandleTopLevelDecl(DeclGroupRef DG) override {
+      if (ReplayingLegacyCallbacks)
+        return true;
+
       // Ignore interesting decls from the AST reader after IRGen is finished.
       if (IRGenFinished)
         return true; // We can't CodeGen more but pass to other consumers.
@@ -188,6 +215,10 @@ namespace {
       if (Diags.hasUnrecoverableErrorOccurred())
         return true;
 
+      if (RecordLegacyCallbacks)
+        LegacyCallbackEvents.emplace_back([this, DG] {
+          LegacyCallbackAudit->HandleTopLevelDecl(DG);
+        });
       HandlingTopLevelDeclRAII HandlingDecl(*this);
 
       // Make sure to emit all elements of a Decl.
@@ -211,8 +242,16 @@ namespace {
     }
 
     void HandleInlineFunctionDefinition(FunctionDecl *D) override {
+      if (ReplayingLegacyCallbacks)
+        return;
+
       if (Diags.hasUnrecoverableErrorOccurred())
         return;
+
+      if (RecordLegacyCallbacks)
+        LegacyCallbackEvents.emplace_back([this, D] {
+          LegacyCallbackAudit->HandleInlineFunctionDefinition(D);
+        });
 
       assert(D->doesThisDeclarationHaveABody());
 
@@ -238,8 +277,16 @@ namespace {
     /// client hack on the type, which can occur at any point in the file
     /// (because these can be defined in declspecs).
     void HandleTagDeclDefinition(TagDecl *D) override {
+      if (ReplayingLegacyCallbacks)
+        return;
+
       if (Diags.hasUnrecoverableErrorOccurred())
         return;
+
+      if (RecordLegacyCallbacks)
+        LegacyCallbackEvents.emplace_back([this, D] {
+          LegacyCallbackAudit->HandleTagDeclDefinition(D);
+        });
 
       // Don't allow re-entrant calls to CodeGen triggered by PCH
       // deserialization to emit deferred decls.
@@ -275,8 +322,16 @@ namespace {
     }
 
     void HandleTagDeclRequiredDefinition(const TagDecl *D) override {
+      if (ReplayingLegacyCallbacks)
+        return;
+
       if (Diags.hasUnrecoverableErrorOccurred())
         return;
+
+      if (RecordLegacyCallbacks)
+        LegacyCallbackEvents.emplace_back([this, D] {
+          LegacyCallbackAudit->HandleTagDeclRequiredDefinition(D);
+        });
 
       // Don't allow re-entrant calls to CodeGen triggered by PCH
       // deserialization to emit deferred decls.
@@ -292,6 +347,36 @@ namespace {
       if (!Diags.hasUnrecoverableErrorOccurred() && Builder)
         Builder->Release();
 
+      if (RecordLegacyCallbacks && Builder->SawLegacyWasmCandidateAddress &&
+          !Diags.hasErrorOccurred() && M) {
+        // Stock CodeGen is complete. Lazy AST/PCH callbacks from replay must
+        // not emit into its module, including during the final AST audit.
+        ReplayingLegacyCallbacks = true;
+        // Replay diagnostics must never reach the production consumer or its
+        // error state. An audit-only error simply keeps the stock module.
+        DiagnosticsEngine AuditDiags(Diags.getDiagnosticIDs(),
+                                     Diags.getDiagnosticOptions(),
+                                     new IgnoringDiagConsumer);
+        AuditDiags.setSourceManager(&Ctx.getSourceManager());
+        ProcessWarningOptions(AuditDiags, Diags.getDiagnosticOptions(), *FS,
+                              /*ReportDiags=*/false);
+        LegacyCallbackContext = std::make_unique<llvm::LLVMContext>();
+        LegacyCallbackAudit = std::make_unique<CodeGeneratorImpl>(
+            AuditDiags, M->getModuleIdentifier(), FS, HeaderSearchOpts,
+            PreprocessorOpts, CodeGenOpts, *LegacyCallbackContext, CoverageInfo,
+            /*IsLegacyCallbackAudit=*/true);
+        LegacyCallbackAudit->Initialize(Ctx);
+        for (const auto &Emit : LegacyCallbackEvents)
+          Emit();
+        LegacyCallbackAudit->HandleTranslationUnit(Ctx);
+        if (!AuditDiags.hasErrorOccurred() && LegacyCallbackAudit->M)
+          Builder->EmitLegacyWasmCallbacks(*LegacyCallbackAudit->Builder);
+        LegacyCallbackAudit.reset();
+        LegacyCallbackContext.reset();
+        ReplayingLegacyCallbacks = false;
+      }
+      LegacyCallbackEvents.clear();
+
       // If there are errors before or when releasing the Builder, reset
       // the module to stop here before invoking the backend.
       if (Diags.hasErrorOccurred()) {
@@ -304,6 +389,9 @@ namespace {
     }
 
     void AssignInheritanceModel(CXXRecordDecl *RD) override {
+      if (ReplayingLegacyCallbacks)
+        return;
+
       if (Diags.hasUnrecoverableErrorOccurred())
         return;
 
@@ -311,17 +399,35 @@ namespace {
     }
 
     void CompleteTentativeDefinition(VarDecl *D) override {
+      if (ReplayingLegacyCallbacks)
+        return;
+
       if (Diags.hasUnrecoverableErrorOccurred())
         return;
+
+      if (RecordLegacyCallbacks)
+        LegacyCallbackEvents.emplace_back([this, D] {
+          LegacyCallbackAudit->CompleteTentativeDefinition(D);
+        });
 
       Builder->EmitTentativeDefinition(D);
     }
 
     void CompleteExternalDeclaration(DeclaratorDecl *D) override {
+      if (ReplayingLegacyCallbacks)
+        return;
+
+      if (RecordLegacyCallbacks)
+        LegacyCallbackEvents.emplace_back([this, D] {
+          LegacyCallbackAudit->CompleteExternalDeclaration(D);
+        });
       Builder->EmitExternalDeclaration(D);
     }
 
     void HandleVTable(CXXRecordDecl *RD) override {
+      if (ReplayingLegacyCallbacks)
+        return;
+
       if (Diags.hasUnrecoverableErrorOccurred())
         return;
 

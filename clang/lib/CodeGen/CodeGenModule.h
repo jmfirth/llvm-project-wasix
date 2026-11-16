@@ -1290,6 +1290,18 @@ public:
   /// Emit an alias for "main" if it has no arguments (needed for wasm).
   void EmitMainVoidAlias();
 
+  /// Give eligible legacy C callbacks one inferred WebAssembly signature.
+  void EmitLegacyWasmCallbacks(CodeGenModule &Audit);
+
+  /// Preserve the provenance of source function addresses until the audit.
+  llvm::Constant *getLegacyWasmSourceAddress(const FunctionDecl *FD,
+                                           llvm::Constant *Address);
+
+  bool LegacyWasmSourceAddressTagging = false;
+  bool SawLegacyWasmCandidateAddress = false;
+  llvm::MapVector<const FunctionDecl *, llvm::GlobalAlias *>
+      LegacyWasmSourceAddresses;
+
   /// Tell the consumer that this variable has been instantiated.
   void HandleCXXStaticMemberVarInstantiation(VarDecl *VD);
 

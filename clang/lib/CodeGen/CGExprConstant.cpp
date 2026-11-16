@@ -2238,6 +2238,7 @@ ConstantLValueEmitter::tryEmitBase(const APValue::LValueBase &base) {
 
     if (const auto *FD = dyn_cast<FunctionDecl>(D)) {
       llvm::Constant *C = CGM.getRawFunctionPointer(FD);
+      C = CGM.getLegacyWasmSourceAddress(FD, C);
       if (FD->getType()->isCFIUncheckedCalleeFunctionType())
         C = llvm::NoCFIValue::get(cast<llvm::GlobalValue>(C));
       return PtrAuthSign(C);
